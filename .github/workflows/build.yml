@@ -4,11 +4,6 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
-    paths:
-      - "*.cpp"
-      - "*.h"
-      - "build-ci.ps1"
-      - ".github/workflows/build.yml"
 
 jobs:
   build:
@@ -20,6 +15,15 @@ jobs:
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
+
+      - name: Install WTL
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $wtl = "$env:RUNNER_TEMP\WTL"
+          git clone --depth 1 https://github.com/Win32-WTL/WTL.git $wtl
+          Write-Host "WTL installed at $wtl"
+          echo "WTL_INCLUDE=$wtl\Include" >> $env:GITHUB_ENV
 
       - name: Download foobar2000 SDK
         shell: powershell
@@ -33,17 +37,10 @@ jobs:
       - name: Prepare and build component
         shell: powershell
         run: |
-          .\build-ci-v4.ps1 `
+          .\build-ci-v5.ps1 `
             -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk" `
-            -RepoRoot "$env:GITHUB_WORKSPACE"
-
-      - name: Show build output
-        if: always()
-        shell: powershell
-        run: |
-          Write-Host "DLL files found:"
-          Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Filter *.dll -Recurse -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length
+            -RepoRoot "$env:GITHUB_WORKSPACE" `
+            -WtlInclude "$env:WTL_INCLUDE"
 
       - name: Upload component
         uses: actions/upload-artifact@v4
