@@ -29,8 +29,6 @@ jobs:
             throw "Could not locate Visual Studio installation"
           }
 
-          Write-Host "Visual Studio installation: $vsPath"
-
           $args = @(
             "modify",
             "--installPath", "`"$vsPath`"",
@@ -88,7 +86,7 @@ jobs:
       - name: Prepare and build component
         shell: powershell
         run: |
-          .\build-ci-v8.ps1 `
+          .\build-ci-v9.ps1 `
             -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk" `
             -RepoRoot "$env:GITHUB_WORKSPACE" `
             -WtlInclude "$env:WTL_INCLUDE" `
