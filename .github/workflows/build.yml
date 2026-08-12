@@ -88,7 +88,7 @@ jobs:
       - name: Prepare and build component
         shell: powershell
         run: |
-          .\build-ci-v7.ps1 `
+          .\build-ci-v8.ps1 `
             -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk" `
             -RepoRoot "$env:GITHUB_WORKSPACE" `
             -WtlInclude "$env:WTL_INCLUDE" `
