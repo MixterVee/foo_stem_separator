@@ -7,31 +7,42 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Add MSBuild to PATH
+      - name: Add Visual Studio 2022 MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
 
-      - name: Install Visual Studio ATL
+      - name: Locate Visual Studio 2022
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -version "[17.0,18.0)" -products * -property installationPath
+          if (-not $vsPath) {
+            throw "Visual Studio 2022 was not found."
+          }
+          Write-Host "VS2022: $vsPath"
+          "VS2022_PATH=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install ATL for VS2022
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
-
-          $vsPath = & $vswhere -latest -products * -property installationPath
-          if (-not $vsPath) {
-            throw "Could not locate Visual Studio installation"
+          if (-not (Test-Path $installer)) {
+            throw "Visual Studio Installer setup.exe not found."
           }
 
           $args = @(
             "modify",
-            "--installPath", "`"$vsPath`"",
+            "--installPath", "`"$env:VS2022_PATH`"",
             "--add", "Microsoft.VisualStudio.Component.VC.ATL",
             "--quiet",
             "--norestart"
@@ -39,38 +50,51 @@ jobs:
 
           $p = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
-            throw "Visual Studio Installer failed with exit code $($p.ExitCode)"
+            throw "ATL installation failed with exit code $($p.ExitCode)"
           }
 
-      - name: Find ATL header
+      - name: Verify VS2022 ATL
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-
-          $atl = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" `
+          $atl = Get-ChildItem "$env:VS2022_PATH\VC\Tools\MSVC" `
             -Filter atlbase.h -Recurse -ErrorAction SilentlyContinue |
             Select-Object -First 1
 
           if (-not $atl) {
-            throw "atlbase.h not found."
+            throw "VS2022 atlbase.h not found."
           }
 
           $atlInclude = $atl.Directory.FullName
-          Write-Host "Found atlbase.h:"
+          Write-Host "ATL header:"
           Write-Host $atl.FullName
-          Write-Host "ATL include directory:"
-          Write-Host $atlInclude
-
           "ATL_INCLUDE=$atlInclude" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Install WTL
+      - name: Install NuGet
+        uses: nuget/setup-nuget@v2
+
+      - name: Install WTL 10.0.10320
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $wtl = "$env:RUNNER_TEMP\WTL"
-          git clone --depth 1 https://github.com/Win32-WTL/WTL.git $wtl
-          $wtlInclude = "$wtl\Include"
-          Write-Host "WTL include directory:"
+
+          $packages = "$env:RUNNER_TEMP\packages"
+          New-Item -ItemType Directory -Force $packages | Out-Null
+
+          nuget install wtl `
+            -Version 10.0.10320 `
+            -OutputDirectory $packages `
+            -NonInteractive
+
+          $wtlHeader = Get-ChildItem $packages -Filter atlapp.h -Recurse |
+            Select-Object -First 1
+
+          if (-not $wtlHeader) {
+            throw "WTL 10.0.10320 atlapp.h was not found."
+          }
+
+          $wtlInclude = $wtlHeader.Directory.FullName
+          Write-Host "WTL 10.0.10320 include:"
           Write-Host $wtlInclude
           "WTL_INCLUDE=$wtlInclude" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -86,7 +110,7 @@ jobs:
       - name: Prepare and build component
         shell: powershell
         run: |
-          .\build-ci-v9.ps1 `
+          .\build-ci-v10.ps1 `
             -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk" `
             -RepoRoot "$env:GITHUB_WORKSPACE" `
             -WtlInclude "$env:WTL_INCLUDE" `
