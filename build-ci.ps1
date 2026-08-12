@@ -11,8 +11,6 @@ $ErrorActionPreference = "Stop"
 Write-Host "SDK root:  $SdkRoot"
 Write-Host "Repo root: $RepoRoot"
 
-# Find the SDK's own foo_sample Visual Studio project rather than assuming
-# an exact folder layout. This keeps the CI script tolerant of the SDK archive.
 $sampleProject = Get-ChildItem -Path $SdkRoot -Filter "foo_sample.vcxproj" -Recurse |
     Select-Object -First 1
 
@@ -26,7 +24,6 @@ if (-not $sampleProject) {
 $sampleDir = $sampleProject.Directory.FullName
 Write-Host "Using SDK sample project: $($sampleProject.FullName)"
 
-# Work in a copy so the downloaded SDK remains untouched.
 $workRoot = Join-Path $RepoRoot "_ci_component"
 if (Test-Path $workRoot) {
     Remove-Item $workRoot -Recurse -Force
@@ -40,7 +37,6 @@ if (-not $project) {
     throw "Copied foo_sample.vcxproj could not be found."
 }
 
-# Copy our component sources into the sample project directory.
 $requiredSources = @(
     "foo_stem_separator.cpp",
     "stem_engine.cpp",
@@ -55,34 +51,30 @@ foreach ($name in $requiredSources) {
     Copy-Item $src (Join-Path $workRoot $name) -Force
 }
 
-# Modify the SDK sample project in-place. We retain the SDK's project
-# references, include paths, configuration, resources and linker defaults.
 [xml]$xml = Get-Content $project.FullName
 
 $nsUri = $xml.Project.NamespaceURI
 $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
 $ns.AddNamespace("m", $nsUri)
 
-# Remove the sample C/C++ compilation units.
+# Remove SDK sample source/header entries.
 $compileNodes = @($xml.SelectNodes("//m:ClCompile", $ns))
 foreach ($node in $compileNodes) {
     [void]$node.ParentNode.RemoveChild($node)
 }
 
-# Remove sample headers; our own header is added below.
 $includeNodes = @($xml.SelectNodes("//m:ClInclude", $ns))
 foreach ($node in $includeNodes) {
     [void]$node.ParentNode.RemoveChild($node)
 }
 
-# Add our .cpp files.
+# Add our sources.
 $itemGroup = $xml.CreateElement("ItemGroup", $nsUri)
 
 foreach ($cpp in @("foo_stem_separator.cpp", "stem_engine.cpp")) {
     $n = $xml.CreateElement("ClCompile", $nsUri)
     $n.SetAttribute("Include", $cpp)
 
-    # Explicitly disable PCH for our standalone sources.
     $pch = $xml.CreateElement("PrecompiledHeader", $nsUri)
     $pch.InnerText = "NotUsing"
     [void]$n.AppendChild($pch)
@@ -95,7 +87,7 @@ $h.SetAttribute("Include", "stem_engine.h")
 [void]$itemGroup.AppendChild($h)
 [void]$xml.Project.AppendChild($itemGroup)
 
-# Make the output DLL name foo_stem_separator.dll in every configuration.
+# Set DLL name.
 $propertyGroups = @($xml.SelectNodes("//m:PropertyGroup", $ns))
 foreach ($pg in $propertyGroups) {
     if ($pg.GetAttribute("Condition")) {
@@ -108,7 +100,24 @@ foreach ($pg in $propertyGroups) {
     }
 }
 
-# Add libraries used by stem_engine.cpp to every linker configuration.
+# IMPORTANT: std::filesystem requires C++17 or newer.
+$itemDefs = @($xml.SelectNodes("//m:ItemDefinitionGroup", $ns))
+foreach ($idg in $itemDefs) {
+    $cl = $idg.SelectSingleNode("m:ClCompile", $ns)
+    if (-not $cl) {
+        $cl = $xml.CreateElement("ClCompile", $nsUri)
+        [void]$idg.AppendChild($cl)
+    }
+
+    $lang = $cl.SelectSingleNode("m:LanguageStandard", $ns)
+    if (-not $lang) {
+        $lang = $xml.CreateElement("LanguageStandard", $nsUri)
+        [void]$cl.AppendChild($lang)
+    }
+    $lang.InnerText = "stdcpp17"
+}
+
+# Add required Windows libraries.
 $linkNodes = @($xml.SelectNodes("//m:ItemDefinitionGroup/m:Link", $ns))
 foreach ($link in $linkNodes) {
     $deps = $link.SelectSingleNode("m:AdditionalDependencies", $ns)
@@ -127,7 +136,6 @@ $xml.Save($project.FullName)
 Write-Host "Patched project:"
 Write-Host $project.FullName
 
-# Detect the x64 Release configuration from the SDK sample.
 $projectText = Get-Content $project.FullName -Raw
 if ($projectText -match "Release\|x64") {
     $configuration = "Release"
@@ -143,6 +151,7 @@ if ($projectText -match "Release\|x64") {
 }
 
 Write-Host "Building Configuration=$configuration Platform=$platform"
+Write-Host "C++ language standard: C++17"
 
 msbuild $project.FullName `
     /m `
@@ -151,6 +160,7 @@ msbuild $project.FullName `
     /p:Platform="$platform" `
     /p:OutDir="$RepoRoot\dist\" `
     /p:TargetName="foo_stem_separator" `
+    /p:LanguageStandard=stdcpp17 `
     /v:minimal
 
 if ($LASTEXITCODE -ne 0) {
