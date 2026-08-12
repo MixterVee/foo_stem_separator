@@ -24,20 +24,12 @@ jobs:
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
 
-          if (-not (Test-Path $vswhere)) {
-            throw "vswhere.exe not found"
-          }
-          if (-not (Test-Path $installer)) {
-            throw "Visual Studio installer setup.exe not found"
-          }
-
           $vsPath = & $vswhere -latest -products * -property installationPath
           if (-not $vsPath) {
             throw "Could not locate Visual Studio installation"
           }
 
           Write-Host "Visual Studio installation: $vsPath"
-          Write-Host "Installing ATL component..."
 
           $args = @(
             "modify",
@@ -52,9 +44,7 @@ jobs:
             throw "Visual Studio Installer failed with exit code $($p.ExitCode)"
           }
 
-          Write-Host "ATL installation step completed."
-
-      - name: Verify ATL header
+      - name: Find ATL header
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -64,11 +54,16 @@ jobs:
             Select-Object -First 1
 
           if (-not $atl) {
-            throw "atlbase.h still not found after ATL installation."
+            throw "atlbase.h not found."
           }
 
+          $atlInclude = $atl.Directory.FullName
           Write-Host "Found atlbase.h:"
           Write-Host $atl.FullName
+          Write-Host "ATL include directory:"
+          Write-Host $atlInclude
+
+          "ATL_INCLUDE=$atlInclude" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install WTL
         shell: powershell
@@ -76,8 +71,10 @@ jobs:
           $ErrorActionPreference = "Stop"
           $wtl = "$env:RUNNER_TEMP\WTL"
           git clone --depth 1 https://github.com/Win32-WTL/WTL.git $wtl
-          Write-Host "WTL installed at $wtl"
-          echo "WTL_INCLUDE=$wtl\Include" >> $env:GITHUB_ENV
+          $wtlInclude = "$wtl\Include"
+          Write-Host "WTL include directory:"
+          Write-Host $wtlInclude
+          "WTL_INCLUDE=$wtlInclude" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Download foobar2000 SDK
         shell: powershell
@@ -91,10 +88,11 @@ jobs:
       - name: Prepare and build component
         shell: powershell
         run: |
-          .\build-ci-v6.ps1 `
+          .\build-ci-v7.ps1 `
             -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk" `
             -RepoRoot "$env:GITHUB_WORKSPACE" `
-            -WtlInclude "$env:WTL_INCLUDE"
+            -WtlInclude "$env:WTL_INCLUDE" `
+            -AtlInclude "$env:ATL_INCLUDE"
 
       - name: Upload component
         uses: actions/upload-artifact@v4
