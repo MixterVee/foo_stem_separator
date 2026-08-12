@@ -1,0 +1,53 @@
+name: Build foobar2000 component
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "*.cpp"
+      - "*.h"
+      - "build-ci.ps1"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Download foobar2000 SDK
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdkUrl = "https://www.foobar2000.org/downloads/SDK-2025-03-07.7z"
+          Invoke-WebRequest -Uri $sdkUrl -OutFile "$env:RUNNER_TEMP\foobar2000-sdk.7z"
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\foobar2000-sdk" | Out-Null
+          7z x "$env:RUNNER_TEMP\foobar2000-sdk.7z" "-o$env:RUNNER_TEMP\foobar2000-sdk" -y
+
+      - name: Prepare and build component
+        shell: powershell
+        run: |
+          .\build-ci.ps1 `
+            -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk" `
+            -RepoRoot "$env:GITHUB_WORKSPACE"
+
+      - name: Show build output
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "DLL files found:"
+          Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Filter *.dll -Recurse -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length
+
+      - name: Upload component
+        uses: actions/upload-artifact@v4
+        with:
+          name: foo_stem_separator-x64
+          path: dist/**
+          if-no-files-found: error
