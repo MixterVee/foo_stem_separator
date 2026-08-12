@@ -16,6 +16,60 @@ jobs:
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
+      - name: Install Visual Studio ATL
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found"
+          }
+          if (-not (Test-Path $installer)) {
+            throw "Visual Studio installer setup.exe not found"
+          }
+
+          $vsPath = & $vswhere -latest -products * -property installationPath
+          if (-not $vsPath) {
+            throw "Could not locate Visual Studio installation"
+          }
+
+          Write-Host "Visual Studio installation: $vsPath"
+          Write-Host "Installing ATL component..."
+
+          $args = @(
+            "modify",
+            "--installPath", "`"$vsPath`"",
+            "--add", "Microsoft.VisualStudio.Component.VC.ATL",
+            "--quiet",
+            "--norestart"
+          )
+
+          $p = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "Visual Studio Installer failed with exit code $($p.ExitCode)"
+          }
+
+          Write-Host "ATL installation step completed."
+
+      - name: Verify ATL header
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $atl = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" `
+            -Filter atlbase.h -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (-not $atl) {
+            throw "atlbase.h still not found after ATL installation."
+          }
+
+          Write-Host "Found atlbase.h:"
+          Write-Host $atl.FullName
+
       - name: Install WTL
         shell: powershell
         run: |
@@ -37,7 +91,7 @@ jobs:
       - name: Prepare and build component
         shell: powershell
         run: |
-          .\build-ci-v5.ps1 `
+          .\build-ci-v6.ps1 `
             -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk" `
             -RepoRoot "$env:GITHUB_WORKSPACE" `
             -WtlInclude "$env:WTL_INCLUDE"
