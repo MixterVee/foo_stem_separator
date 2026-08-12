@@ -33,7 +33,7 @@ jobs:
       - name: Prepare and build component
         shell: powershell
         run: |
-          .\build-ci-v3.ps1 `
+          .\build-ci-v4.ps1 `
             -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk" `
             -RepoRoot "$env:GITHUB_WORKSPACE"
 
