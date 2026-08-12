@@ -127,7 +127,7 @@ try {
     $xml.Save($projectPath)
 
     # Force exact ATL + WTL include paths into all CL invocations.
-    $forced = '/I"' + $AtlInclude + '" /I"' + $WtlInclude + '"'
+   $forced = '/I"' + $SdkRoot + '" /I"' + $AtlInclude + '" /I"' + $WtlInclude + '"'
     if ([string]::IsNullOrWhiteSpace($env:CL)) {
         $env:CL = $forced
     } else {
