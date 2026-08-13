@@ -1,6 +1,7 @@
 #include <foobar2000/SDK/foobar2000.h>
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include "onnx_stem_engine.h"
@@ -8,8 +9,10 @@
 
 namespace {
 
-constexpr double kWindowSeconds = 2.0;
-constexpr double kOverlapSeconds = 0.5;
+constexpr double kWindowSeconds = 4.0;
+constexpr double kOverlapSeconds = 1.0;
+constexpr double kDeclickSeconds = 0.005; // 5 ms
+
 constexpr unsigned kRate = 44100;
 constexpr unsigned kChannels = 2;
 
@@ -33,7 +36,9 @@ public:
         return true;
     }
 
-    static bool g_have_config_popup() { return false; }
+    static bool g_have_config_popup() {
+        return false;
+    }
 
     static void g_show_config_popup(
         const dsp_preset&,
@@ -76,18 +81,24 @@ public:
 
         const size_t window_frames =
             static_cast<size_t>(kRate * kWindowSeconds);
+
         const size_t overlap_frames =
             static_cast<size_t>(kRate * kOverlapSeconds);
+
         const size_t hop_frames =
             window_frames - overlap_frames;
 
-        const size_t window_values = window_frames * kChannels;
-        const size_t hop_values = hop_frames * kChannels;
+        const size_t window_values =
+            window_frames * kChannels;
+
+        const size_t hop_values =
+            hop_frames * kChannels;
 
         while (m_input.size() >= window_values) {
             std::vector<float> window(
                 m_input.begin(),
-                m_input.begin() + static_cast<std::ptrdiff_t>(window_values));
+                m_input.begin() +
+                    static_cast<std::ptrdiff_t>(window_values));
 
             std::vector<float> vocals;
             std::vector<float> instrumental;
@@ -113,20 +124,35 @@ public:
                 hop_frames,
                 overlap_frames);
 
+            // Move forward by the hop but retain the overlap region.
             m_input.erase(
                 m_input.begin(),
-                m_input.begin() + static_cast<std::ptrdiff_t>(hop_values));
+                m_input.begin() +
+                    static_cast<std::ptrdiff_t>(hop_values));
         }
 
         return false;
     }
 
-    void on_endofplayback(abort_callback&) override { flush_tail(); }
-    void on_endoftrack(abort_callback&) override { flush_tail(); }
-    void flush() override { reset_state(); }
+    void on_endofplayback(abort_callback&) override {
+        flush_tail();
+    }
 
-    double get_latency() override { return kWindowSeconds; }
-    bool need_track_change_mark() override { return true; }
+    void on_endoftrack(abort_callback&) override {
+        flush_tail();
+    }
+
+    void flush() override {
+        reset_state();
+    }
+
+    double get_latency() override {
+        return kWindowSeconds;
+    }
+
+    bool need_track_change_mark() override {
+        return true;
+    }
 
 private:
     static const std::vector<float>& select_mode(
@@ -137,8 +163,10 @@ private:
         switch (stemmode::get()) {
         case stemmode::mode::vocals:
             return vocals;
+
         case stemmode::mode::instrumental:
             return instrumental;
+
         case stemmode::mode::original:
         default:
             return original;
@@ -153,65 +181,169 @@ private:
         size_t hop_frames,
         size_t overlap_frames) {
 
-        const auto& current = select_mode(
-            original, vocals, instrumental);
+        const auto& current =
+            select_mode(original, vocals, instrumental);
 
         std::vector<float> segment;
         segment.reserve(hop_frames * kChannels);
 
         if (!m_have_previous_tail) {
+            // First window: emit one hop directly.
             segment.insert(
                 segment.end(),
                 current.begin(),
                 current.begin() +
-                    static_cast<std::ptrdiff_t>(hop_frames * kChannels));
-        } else {
-            for (size_t f = 0; f < overlap_frames; ++f) {
-                const float t =
-                    overlap_frames > 1
-                        ? static_cast<float>(f) /
-                            static_cast<float>(overlap_frames - 1)
-                        : 1.0f;
+                    static_cast<std::ptrdiff_t>(
+                        hop_frames * kChannels));
+        }
+        else {
+            // Raised-cosine overlap:
+            //
+            // prev gain = cos^2(pi/2 * t)
+            // curr gain = sin^2(pi/2 * t)
+            //
+            // The two gains always sum to 1, but change much more smoothly
+            // than a straight linear crossfade.
+            constexpr double kHalfPi =
+                1.57079632679489661923;
 
-                for (size_t c = 0; c < kChannels; ++c) {
-                    const size_t i = f * kChannels + c;
+            for (size_t f = 0; f < overlap_frames; ++f) {
+                const double t =
+                    overlap_frames > 1
+                        ? static_cast<double>(f) /
+                            static_cast<double>(overlap_frames - 1)
+                        : 1.0;
+
+                const double c =
+                    std::cos(kHalfPi * t);
+
+                const double s =
+                    std::sin(kHalfPi * t);
+
+                const float gain_prev =
+                    static_cast<float>(c * c);
+
+                const float gain_curr =
+                    static_cast<float>(s * s);
+
+                for (size_t ch = 0; ch < kChannels; ++ch) {
+                    const size_t i =
+                        f * kChannels + ch;
+
                     segment.push_back(
-                        m_previous_tail[i] * (1.0f - t) +
-                        current[i] * t);
+                        m_previous_tail[i] * gain_prev +
+                        current[i] * gain_curr);
                 }
             }
 
-            const size_t start = overlap_frames * kChannels;
-            const size_t end = hop_frames * kChannels;
+            // Emit the non-overlap remainder of this hop.
+            const size_t start =
+                overlap_frames * kChannels;
+
+            const size_t end =
+                hop_frames * kChannels;
 
             segment.insert(
                 segment.end(),
-                current.begin() + static_cast<std::ptrdiff_t>(start),
-                current.begin() + static_cast<std::ptrdiff_t>(end));
+                current.begin() +
+                    static_cast<std::ptrdiff_t>(start),
+                current.begin() +
+                    static_cast<std::ptrdiff_t>(end));
         }
 
-        const size_t tail_start = hop_frames * kChannels;
-        const size_t tail_end = window_frames * kChannels;
+        // Hold the final overlap for the next overlap-add.
+        const size_t tail_start =
+            hop_frames * kChannels;
+
+        const size_t tail_end =
+            window_frames * kChannels;
 
         m_previous_tail.assign(
-            current.begin() + static_cast<std::ptrdiff_t>(tail_start),
-            current.begin() + static_cast<std::ptrdiff_t>(tail_end));
+            current.begin() +
+                static_cast<std::ptrdiff_t>(tail_start),
+            current.begin() +
+                static_cast<std::ptrdiff_t>(tail_end));
 
         m_have_previous_tail = true;
+
+        apply_declick(segment);
         emit_audio(segment);
+    }
+
+    void apply_declick(std::vector<float>& samples) {
+        if (samples.empty()) return;
+
+        const size_t frames =
+            samples.size() / kChannels;
+
+        if (frames == 0) return;
+
+        const size_t ramp_frames =
+            std::min<size_t>(
+                frames,
+                static_cast<size_t>(
+                    kRate * kDeclickSeconds));
+
+        if (!m_have_last_output_sample) {
+            // First emitted block: just remember its last frame.
+            m_last_left =
+                samples[(frames - 1) * kChannels];
+
+            m_last_right =
+                samples[(frames - 1) * kChannels + 1];
+
+            m_have_last_output_sample = true;
+            return;
+        }
+
+        // Compute the discontinuity between the previously emitted final
+        // sample and the first sample of this segment. We do NOT fade the audio
+        // to silence; instead we fade only that correction back to zero over
+        // 5 ms, preserving the underlying signal.
+        const float delta_left =
+            m_last_left - samples[0];
+
+        const float delta_right =
+            m_last_right - samples[1];
+
+        for (size_t f = 0; f < ramp_frames; ++f) {
+            const float w =
+                ramp_frames > 1
+                    ? 1.0f -
+                        static_cast<float>(f) /
+                        static_cast<float>(ramp_frames - 1)
+                    : 0.0f;
+
+            samples[f * kChannels] +=
+                delta_left * w;
+
+            samples[f * kChannels + 1] +=
+                delta_right * w;
+        }
+
+        m_last_left =
+            samples[(frames - 1) * kChannels];
+
+        m_last_right =
+            samples[(frames - 1) * kChannels + 1];
     }
 
     void emit_audio(const std::vector<float>& samples) {
         if (samples.empty()) return;
 
-        const size_t frames = samples.size() / kChannels;
-        std::vector<audio_sample> fb(samples.size());
+        const size_t frames =
+            samples.size() / kChannels;
+
+        std::vector<audio_sample> fb(
+            samples.size());
 
         for (size_t i = 0; i < samples.size(); ++i) {
-            fb[i] = static_cast<audio_sample>(samples[i]);
+            fb[i] =
+                static_cast<audio_sample>(samples[i]);
         }
 
-        audio_chunk* out = insert_chunk(fb.size());
+        audio_chunk* out =
+            insert_chunk(fb.size());
 
         out->set_data(
             fb.data(),
@@ -222,12 +354,45 @@ private:
     }
 
     void flush_tail() {
-        if (m_have_previous_tail && !m_previous_tail.empty()) {
-            emit_audio(m_previous_tail);
+        const size_t overlap_frames =
+            static_cast<size_t>(
+                kRate * kOverlapSeconds);
+
+        const size_t overlap_values =
+            overlap_frames * kChannels;
+
+        // Emit the processed overlap that was held from the last complete
+        // analysis window.
+        if (m_have_previous_tail &&
+            !m_previous_tail.empty()) {
+
+            std::vector<float> tail =
+                m_previous_tail;
+
+            apply_declick(tail);
+            emit_audio(tail);
         }
 
+        // m_input still begins with the SAME overlap region we just emitted.
+        // Skip that duplicate region and pass through only any true residual
+        // audio after it.
         if (!m_input.empty()) {
-            emit_audio(m_input);
+            const size_t skip =
+                m_have_previous_tail
+                    ? std::min(
+                        overlap_values,
+                        m_input.size())
+                    : 0;
+
+            if (m_input.size() > skip) {
+                std::vector<float> residual(
+                    m_input.begin() +
+                        static_cast<std::ptrdiff_t>(skip),
+                    m_input.end());
+
+                apply_declick(residual);
+                emit_audio(residual);
+            }
         }
 
         reset_state();
@@ -237,6 +402,11 @@ private:
         m_input.clear();
         m_previous_tail.clear();
         m_have_previous_tail = false;
+
+        m_have_last_output_sample = false;
+        m_last_left = 0.0f;
+        m_last_right = 0.0f;
+
         m_rate = 0;
         m_channels = 0;
         m_channel_config = 0;
@@ -244,7 +414,12 @@ private:
 
     std::vector<float> m_input;
     std::vector<float> m_previous_tail;
+
     bool m_have_previous_tail = false;
+
+    bool m_have_last_output_sample = false;
+    float m_last_left = 0.0f;
+    float m_last_right = 0.0f;
 
     unsigned m_rate = 0;
     unsigned m_channels = 0;
@@ -253,6 +428,7 @@ private:
     onnxstem::engine m_engine;
 };
 
-static dsp_factory_t<stem_dsp> g_stem_dsp_factory;
+static dsp_factory_t<stem_dsp>
+    g_stem_dsp_factory;
 
 } // namespace
