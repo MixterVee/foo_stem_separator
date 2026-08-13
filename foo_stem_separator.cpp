@@ -38,10 +38,10 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "1.2.0 seek-safe back-pressure + whole-track WAV export",
+    "1.3.0 position-cache live + whole-track WAV export",
     "Native ONNX vocals / instrumental separation.\n"
-    "Seek-safe bounded live worker plus whole-track WAV export.\n"
-    "Export uses one Spleeter inference for the entire decoded track—no stitched windows."
+    "Zero-latency position-cache live playback plus whole-track WAV export.\n"
+    "Live stems use independent read-ahead caching; export uses whole-track Spleeter inference."
 );
 
 VALIDATE_COMPONENT_FILENAME("foo_stem_separator.dll");

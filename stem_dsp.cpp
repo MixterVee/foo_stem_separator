@@ -1,471 +1,951 @@
 #include <foobar2000/SDK/foobar2000.h>
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+#include <mfapi.h>
+#include <mferror.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <propidl.h>
+#include <wrl/client.h>
+
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <mutex>
-#include <memory>
+#include <string>
 #include <thread>
-#include <utility>
 #include <vector>
 
 #include "onnx_stem_engine.h"
 #include "stem_mode.h"
 
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "propsys.lib")
+
+using Microsoft::WRL::ComPtr;
+
 namespace {
 
-constexpr double kWindowSeconds = 4.0;
-constexpr double kOverlapSeconds = 1.5;
+constexpr unsigned kCacheRate = 44100;
+constexpr unsigned kCacheChannels = 2;
 
-constexpr unsigned kOnnxRate = 44100;
-constexpr unsigned kChannels = 2;
+constexpr double kCacheSeconds = 30.0;
+constexpr double kCacheOverlapSeconds = 1.0;
+constexpr double kPrefetchSeconds = 10.0;
+constexpr double kSwitchFadeSeconds = 0.050;
 
-static size_t frames_for(double seconds, unsigned rate) {
-    return static_cast<size_t>(
-        seconds * static_cast<double>(rate) + 0.5);
+std::wstring utf8_to_wide_cache(const char* s) {
+    if (!s || !*s) return {};
+
+    const int n = MultiByteToWideChar(
+        CP_UTF8, 0, s, -1, nullptr, 0);
+
+    if (n <= 1) return {};
+
+    std::vector<wchar_t> temp(
+        static_cast<size_t>(n));
+
+    MultiByteToWideChar(
+        CP_UTF8,
+        0,
+        s,
+        -1,
+        temp.data(),
+        n);
+
+    return std::wstring(temp.data());
 }
 
-static std::vector<float> resample_stereo_linear(
-    const std::vector<float>& input,
-    size_t input_frames,
-    unsigned input_rate,
-    unsigned output_rate,
-    size_t output_frames) {
+std::wstring local_path_from_metadb(
+    metadb_handle_ptr handle) {
 
-    std::vector<float> output(
-        output_frames * kChannels,
-        0.0f);
+    if (handle.is_empty()) return {};
 
-    if (input_frames == 0 || output_frames == 0) {
-        return output;
+    std::wstring path =
+        utf8_to_wide_cache(
+            handle->get_path());
+
+    const std::wstring prefix =
+        L"file://";
+
+    if (path.rfind(prefix, 0) == 0) {
+        path.erase(0, prefix.size());
     }
 
-    if (input_rate == output_rate &&
-        input_frames == output_frames) {
-        return input;
-    }
-
-    if (input_frames == 1) {
-        for (size_t f = 0; f < output_frames; ++f) {
-            output[f * 2] = input[0];
-            output[f * 2 + 1] = input[1];
-        }
-        return output;
-    }
-
-    const double ratio =
-        static_cast<double>(input_rate) /
-        static_cast<double>(output_rate);
-
-    for (size_t out_f = 0; out_f < output_frames; ++out_f) {
-        double source_pos =
-            static_cast<double>(out_f) * ratio;
-
-        size_t i0 =
-            static_cast<size_t>(source_pos);
-
-        if (i0 >= input_frames - 1) {
-            i0 = input_frames - 1;
-            output[out_f * 2] =
-                input[i0 * 2];
-            output[out_f * 2 + 1] =
-                input[i0 * 2 + 1];
-            continue;
-        }
-
-        const size_t i1 = i0 + 1;
-        const float frac =
-            static_cast<float>(
-                source_pos -
-                static_cast<double>(i0));
-
-        const float inv = 1.0f - frac;
-
-        output[out_f * 2] =
-            input[i0 * 2] * inv +
-            input[i1 * 2] * frac;
-
-        output[out_f * 2 + 1] =
-            input[i0 * 2 + 1] * inv +
-            input[i1 * 2 + 1] * frac;
-    }
-
-    return output;
+    return path;
 }
 
-struct separated_segment {
-    std::vector<float> original;
+struct cache_segment {
+    uint64_t generation = 0;
+    double start_seconds = 0.0;
+    double end_seconds = 0.0;
+
     std::vector<float> vocals;
     std::vector<float> instrumental;
-
-    std::vector<float> original_tail;
-    std::vector<float> vocals_tail;
-    std::vector<float> instrumental_tail;
 };
 
-class separator_worker {
+struct cache_job {
+    uint64_t generation = 0;
+    std::wstring path;
+    double start_seconds = 0.0;
+};
+
+class live_cache_manager {
 public:
-    separator_worker() {
-        m_thread = std::thread([this]() { run(); });
+    live_cache_manager() {
+        m_thread =
+            std::thread(
+                [this]() { worker_main(); });
     }
 
-    ~separator_worker() {
+    ~live_cache_manager() {
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
+            std::lock_guard<std::mutex> lock(
+                m_mutex);
+
             m_stop = true;
         }
 
-        m_job_cv.notify_all();
-        m_ready_cv.notify_all();
+        m_cv.notify_all();
 
         if (m_thread.joinable()) {
             m_thread.join();
         }
     }
 
-    void submit(
-        std::vector<float> source_window,
-        unsigned source_rate) {
+    uint64_t generation() const {
+        std::lock_guard<std::mutex> lock(
+            m_mutex);
 
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-
-            m_jobs.emplace_back(job{
-                m_generation,
-                source_rate,
-                std::move(source_window)
-            });
-        }
-
-        m_job_cv.notify_one();
+        return m_generation;
     }
 
-    bool try_pop(separated_segment& out) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+    double anchor_time() const {
+        std::lock_guard<std::mutex> lock(
+            m_mutex);
 
-        if (m_ready.empty()) {
-            return false;
-        }
-
-        out = std::move(m_ready.front());
-        m_ready.pop_front();
-        return true;
+        return m_anchor_seconds;
     }
 
-    bool wait_pop(separated_segment& out) {
-        std::unique_lock<std::mutex> lock(m_mutex);
+    void new_track(
+        const std::wstring& path) {
 
-        m_ready_cv.wait(
-            lock,
-            [this]() {
-                return m_stop || !m_ready.empty();
-            });
-
-        if (m_ready.empty()) {
-            return false;
-        }
-
-        out = std::move(m_ready.front());
-        m_ready.pop_front();
-        return true;
-    }
-
-    void reset() {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        std::lock_guard<std::mutex> lock(
+            m_mutex);
 
         ++m_generation;
 
+        m_path = path;
+        m_anchor_seconds = 0.0;
+
+        m_segments.clear();
         m_jobs.clear();
-        m_ready.clear();
+        m_job_pending = false;
 
-        m_prev_original_tail.clear();
-        m_prev_vocals_tail.clear();
-        m_prev_instrumental_tail.clear();
+        if (!m_path.empty() &&
+            stemmode::get() !=
+                stemmode::mode::original) {
 
-        m_have_previous = false;
-        m_previous_rate = 0;
+            queue_job_locked(0.0);
+        }
+
+        m_cv.notify_one();
     }
 
-private:
-    struct job {
-        uint64_t generation = 0;
-        unsigned source_rate = 0;
-        std::vector<float> samples;
-    };
-
-    static void split_hop_and_tail(
-        const std::vector<float>& current,
-        unsigned rate,
-        std::vector<float>& previous_tail,
-        bool have_previous,
-        std::vector<float>& hop,
-        std::vector<float>& tail) {
-
-        const size_t win_frames =
-            frames_for(kWindowSeconds, rate);
-
-        const size_t ov_frames =
-            frames_for(kOverlapSeconds, rate);
-
-        const size_t hp_frames =
-            win_frames - ov_frames;
-
-        hop.clear();
-        hop.reserve(hp_frames * kChannels);
-
-        if (!have_previous) {
-            hop.insert(
-                hop.end(),
-                current.begin(),
-                current.begin() +
-                    static_cast<std::ptrdiff_t>(
-                        hp_frames * kChannels));
+    void seek(double seconds) {
+        if (seconds < 0.0) {
+            seconds = 0.0;
         }
-        else {
-            constexpr double kHalfPi =
-                1.57079632679489661923;
 
-            for (size_t f = 0; f < ov_frames; ++f) {
-                const double t =
-                    ov_frames > 1
-                        ? static_cast<double>(f) /
-                            static_cast<double>(ov_frames - 1)
-                        : 1.0;
+        std::lock_guard<std::mutex> lock(
+            m_mutex);
 
-                const double c =
-                    std::cos(kHalfPi * t);
+        ++m_generation;
+        m_anchor_seconds = seconds;
 
-                const double s =
-                    std::sin(kHalfPi * t);
+        m_segments.clear();
+        m_jobs.clear();
+        m_job_pending = false;
 
-                const float a =
-                    static_cast<float>(c * c);
+        if (!m_path.empty() &&
+            stemmode::get() !=
+                stemmode::mode::original) {
 
-                const float b =
-                    static_cast<float>(s * s);
+            queue_job_locked(seconds);
+        }
 
-                for (size_t ch = 0; ch < kChannels; ++ch) {
-                    const size_t i =
-                        f * kChannels + ch;
+        m_cv.notify_one();
+    }
 
-                    hop.push_back(
-                        previous_tail[i] * a +
-                        current[i] * b);
+    void stop() {
+        std::lock_guard<std::mutex> lock(
+            m_mutex);
+
+        ++m_generation;
+
+        m_path.clear();
+        m_anchor_seconds = 0.0;
+
+        m_segments.clear();
+        m_jobs.clear();
+        m_job_pending = false;
+    }
+
+    void ensure_ahead(double playback_seconds) {
+        if (stemmode::get() ==
+            stemmode::mode::original) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(
+            m_mutex);
+
+        if (m_path.empty() ||
+            m_job_pending) {
+            return;
+        }
+
+        double cache_end = -1.0;
+
+        if (!m_segments.empty()) {
+            cache_end =
+                m_segments.back().end_seconds;
+        }
+
+        // No cache at all: begin at the current playback position.
+        if (cache_end < 0.0) {
+            queue_job_locked(
+                playback_seconds);
+
+            m_cv.notify_one();
+            return;
+        }
+
+        if (cache_end -
+                playback_seconds <=
+            kPrefetchSeconds) {
+
+            double next =
+                cache_end -
+                kCacheOverlapSeconds;
+
+            if (next < playback_seconds) {
+                next = playback_seconds;
+            }
+
+            queue_job_locked(next);
+            m_cv.notify_one();
+        }
+    }
+
+    bool render(
+        stemmode::mode mode,
+        double start_seconds,
+        unsigned output_rate,
+        size_t frames,
+        std::vector<float>& out) {
+
+        if (mode ==
+            stemmode::mode::original) {
+            return false;
+        }
+
+        if (output_rate == 0 ||
+            frames == 0) {
+            return false;
+        }
+
+        std::vector<cache_segment> snapshot;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                m_mutex);
+
+            if (m_segments.empty()) {
+                return false;
+            }
+
+            snapshot.assign(
+                m_segments.begin(),
+                m_segments.end());
+        }
+
+        out.assign(
+            frames * kCacheChannels,
+            0.0f);
+
+        const double dt =
+            1.0 /
+            static_cast<double>(
+                output_rate);
+
+        for (size_t f = 0;
+             f < frames;
+             ++f) {
+
+            const double t =
+                start_seconds +
+                static_cast<double>(f) * dt;
+
+            const cache_segment* first =
+                nullptr;
+
+            const cache_segment* second =
+                nullptr;
+
+            for (const auto& seg :
+                 snapshot) {
+
+                if (t >= seg.start_seconds &&
+                    t < seg.end_seconds) {
+
+                    if (!first) {
+                        first = &seg;
+                    }
+                    else {
+                        second = &seg;
+                        break;
+                    }
                 }
             }
 
-            const size_t start =
-                ov_frames * kChannels;
+            if (!first) {
+                return false;
+            }
 
-            const size_t end =
-                hp_frames * kChannels;
+            auto sample_from =
+                [mode, t](
+                    const cache_segment& seg,
+                    unsigned ch) -> float {
 
-            hop.insert(
-                hop.end(),
-                current.begin() +
-                    static_cast<std::ptrdiff_t>(start),
-                current.begin() +
-                    static_cast<std::ptrdiff_t>(end));
+                const std::vector<float>& data =
+                    mode ==
+                        stemmode::mode::vocals
+                        ? seg.vocals
+                        : seg.instrumental;
+
+                const double rel =
+                    t - seg.start_seconds;
+
+                double source_pos =
+                    rel *
+                    static_cast<double>(
+                        kCacheRate);
+
+                if (source_pos < 0.0) {
+                    source_pos = 0.0;
+                }
+
+                const size_t total_frames =
+                    data.size() /
+                    kCacheChannels;
+
+                if (total_frames == 0) {
+                    return 0.0f;
+                }
+
+                size_t i0 =
+                    static_cast<size_t>(
+                        source_pos);
+
+                if (i0 >=
+                    total_frames - 1) {
+
+                    i0 =
+                        total_frames - 1;
+
+                    return data[
+                        i0 * kCacheChannels +
+                        ch];
+                }
+
+                const size_t i1 =
+                    i0 + 1;
+
+                const float frac =
+                    static_cast<float>(
+                        source_pos -
+                        static_cast<double>(
+                            i0));
+
+                return
+                    data[
+                        i0 * kCacheChannels +
+                        ch] *
+                        (1.0f - frac) +
+                    data[
+                        i1 * kCacheChannels +
+                        ch] *
+                        frac;
+            };
+
+            for (unsigned ch = 0;
+                 ch < kCacheChannels;
+                 ++ch) {
+
+                float value =
+                    sample_from(
+                        *first,
+                        ch);
+
+                if (second) {
+                    const double overlap_start =
+                        second->start_seconds;
+
+                    const double overlap_end =
+                        first->end_seconds;
+
+                    if (overlap_end >
+                            overlap_start &&
+                        t >= overlap_start &&
+                        t < overlap_end) {
+
+                        double x =
+                            (t - overlap_start) /
+                            (overlap_end -
+                             overlap_start);
+
+                        if (x < 0.0) x = 0.0;
+                        if (x > 1.0) x = 1.0;
+
+                        constexpr double kHalfPi =
+                            1.57079632679489661923;
+
+                        const double c =
+                            std::cos(
+                                kHalfPi * x);
+
+                        const double s =
+                            std::sin(
+                                kHalfPi * x);
+
+                        const float a =
+                            static_cast<float>(
+                                c * c);
+
+                        const float b =
+                            static_cast<float>(
+                                s * s);
+
+                        value =
+                            value * a +
+                            sample_from(
+                                *second,
+                                ch) * b;
+                    }
+                }
+
+                out[
+                    f * kCacheChannels +
+                    ch] = value;
+            }
         }
 
-        const size_t tail_start =
-            hp_frames * kChannels;
-
-        const size_t tail_end =
-            win_frames * kChannels;
-
-        tail.assign(
-            current.begin() +
-                static_cast<std::ptrdiff_t>(tail_start),
-            current.begin() +
-                static_cast<std::ptrdiff_t>(tail_end));
-
-        previous_tail = tail;
+        return true;
     }
 
-    void run() {
+private:
+    void queue_job_locked(
+        double start_seconds) {
+
+        if (m_path.empty()) {
+            return;
+        }
+
+        if (start_seconds < 0.0) {
+            start_seconds = 0.0;
+        }
+
+        m_jobs.emplace_back(
+            cache_job{
+                m_generation,
+                m_path,
+                start_seconds});
+
+        m_job_pending = true;
+    }
+
+    static bool configure_reader(
+        IMFSourceReader* reader) {
+
+        ComPtr<IMFMediaType> type;
+
+        HRESULT hr =
+            MFCreateMediaType(&type);
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        type->SetGUID(
+            MF_MT_MAJOR_TYPE,
+            MFMediaType_Audio);
+
+        type->SetGUID(
+            MF_MT_SUBTYPE,
+            MFAudioFormat_Float);
+
+        type->SetUINT32(
+            MF_MT_AUDIO_NUM_CHANNELS,
+            kCacheChannels);
+
+        type->SetUINT32(
+            MF_MT_AUDIO_SAMPLES_PER_SECOND,
+            kCacheRate);
+
+        type->SetUINT32(
+            MF_MT_AUDIO_BITS_PER_SAMPLE,
+            32);
+
+        type->SetUINT32(
+            MF_MT_AUDIO_BLOCK_ALIGNMENT,
+            8);
+
+        type->SetUINT32(
+            MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+            kCacheRate * 8);
+
+        hr =
+            reader->SetCurrentMediaType(
+                MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+                nullptr,
+                type.Get());
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        reader->SetStreamSelection(
+            MF_SOURCE_READER_ALL_STREAMS,
+            FALSE);
+
+        reader->SetStreamSelection(
+            MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+            TRUE);
+
+        return true;
+    }
+
+    static bool decode_segment(
+        const std::wstring& path,
+        double start_seconds,
+        std::vector<float>& audio) {
+
+        ComPtr<IMFSourceReader> reader;
+
+        HRESULT hr =
+            MFCreateSourceReaderFromURL(
+                path.c_str(),
+                nullptr,
+                &reader);
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        if (!configure_reader(
+                reader.Get())) {
+            return false;
+        }
+
+        PROPVARIANT pos;
+        PropVariantInit(&pos);
+
+        pos.vt = VT_I8;
+
+        pos.hVal.QuadPart =
+            static_cast<LONGLONG>(
+                start_seconds *
+                10000000.0);
+
+        hr =
+            reader->SetCurrentPosition(
+                GUID_NULL,
+                pos);
+
+        PropVariantClear(&pos);
+
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        const size_t wanted_frames =
+            static_cast<size_t>(
+                kCacheSeconds *
+                kCacheRate);
+
+        audio.clear();
+        audio.reserve(
+            wanted_frames *
+            kCacheChannels);
+
+        while (audio.size() <
+               wanted_frames *
+               kCacheChannels) {
+
+            DWORD stream_index = 0;
+            DWORD flags = 0;
+            LONGLONG timestamp = 0;
+
+            ComPtr<IMFSample> sample;
+
+            hr =
+                reader->ReadSample(
+                    MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+                    0,
+                    &stream_index,
+                    &flags,
+                    &timestamp,
+                    &sample);
+
+            if (FAILED(hr)) {
+                return false;
+            }
+
+            if (flags &
+                MF_SOURCE_READERF_ENDOFSTREAM) {
+                break;
+            }
+
+            if (!sample) {
+                continue;
+            }
+
+            ComPtr<IMFMediaBuffer> buffer;
+
+            hr =
+                sample->ConvertToContiguousBuffer(
+                    &buffer);
+
+            if (FAILED(hr)) {
+                return false;
+            }
+
+            BYTE* data = nullptr;
+            DWORD max_length = 0;
+            DWORD current_length = 0;
+
+            hr =
+                buffer->Lock(
+                    &data,
+                    &max_length,
+                    &current_length);
+
+            if (FAILED(hr)) {
+                return false;
+            }
+
+            const size_t count =
+                current_length /
+                sizeof(float);
+
+            const float* floats =
+                reinterpret_cast<
+                    const float*>(data);
+
+            const size_t remaining =
+                wanted_frames *
+                    kCacheChannels -
+                audio.size();
+
+            const size_t take =
+                count < remaining
+                    ? count
+                    : remaining;
+
+            audio.insert(
+                audio.end(),
+                floats,
+                floats + take);
+
+            buffer->Unlock();
+        }
+
+        return !audio.empty();
+    }
+
+    void worker_main() {
+        const HRESULT chr =
+            CoInitializeEx(
+                nullptr,
+                COINIT_MULTITHREADED);
+
+        const bool com_ok =
+            SUCCEEDED(chr) ||
+            chr == RPC_E_CHANGED_MODE;
+
+        if (!com_ok) {
+            return;
+        }
+
+        const HRESULT mhr =
+            MFStartup(
+                MF_VERSION,
+                MFSTARTUP_FULL);
+
+        if (FAILED(mhr)) {
+            if (SUCCEEDED(chr)) {
+                CoUninitialize();
+            }
+            return;
+        }
+
         onnxstem::engine engine;
 
         for (;;) {
-            job current_job;
+            cache_job job;
 
             {
-                std::unique_lock<std::mutex> lock(m_mutex);
+                std::unique_lock<std::mutex>
+                    lock(m_mutex);
 
-                m_job_cv.wait(
+                m_cv.wait(
                     lock,
                     [this]() {
-                        return m_stop || !m_jobs.empty();
+                        return
+                            m_stop ||
+                            !m_jobs.empty();
                     });
 
                 if (m_stop) {
-                    return;
+                    break;
                 }
 
-                current_job =
-                    std::move(m_jobs.front());
+                job =
+                    std::move(
+                        m_jobs.front());
 
                 m_jobs.pop_front();
             }
 
-            const unsigned source_rate =
-                current_job.source_rate;
+            std::vector<float> input;
 
-            const size_t source_window_frames =
-                frames_for(
-                    kWindowSeconds,
-                    source_rate);
+            const bool decoded =
+                decode_segment(
+                    job.path,
+                    job.start_seconds,
+                    input);
 
-            const size_t onnx_window_frames =
-                frames_for(
-                    kWindowSeconds,
-                    kOnnxRate);
+            std::vector<float> vocals;
+            std::vector<float> instrumental;
 
-            std::vector<float> onnx_input =
-                resample_stereo_linear(
-                    current_job.samples,
-                    source_window_frames,
-                    source_rate,
-                    kOnnxRate,
-                    onnx_window_frames);
+            bool separated = false;
 
-            std::vector<float> onnx_vocals;
-            std::vector<float> onnx_instrumental;
+            if (decoded) {
+                const size_t frames =
+                    input.size() /
+                    kCacheChannels;
 
-            const bool ok =
-                engine.process_both(
-                    onnx_input.data(),
-                    onnx_window_frames,
-                    kChannels,
-                    kOnnxRate,
-                    onnx_vocals,
-                    onnx_instrumental);
-
-            std::vector<float> source_vocals;
-            std::vector<float> source_instrumental;
-
-            if (ok) {
-                source_vocals =
-                    resample_stereo_linear(
-                        onnx_vocals,
-                        onnx_window_frames,
-                        kOnnxRate,
-                        source_rate,
-                        source_window_frames);
-
-                source_instrumental =
-                    resample_stereo_linear(
-                        onnx_instrumental,
-                        onnx_window_frames,
-                        kOnnxRate,
-                        source_rate,
-                        source_window_frames);
+                separated =
+                    engine.process_both(
+                        input.data(),
+                        frames,
+                        kCacheChannels,
+                        kCacheRate,
+                        vocals,
+                        instrumental);
             }
-            else {
-                source_vocals =
-                    current_job.samples;
-
-                source_instrumental =
-                    current_job.samples;
-            }
-
-            separated_segment segment;
 
             {
-                std::lock_guard<std::mutex> lock(m_mutex);
+                std::lock_guard<std::mutex>
+                    lock(m_mutex);
 
-                if (current_job.generation !=
+                // A seek/new-track happened while this job was running.
+                if (job.generation !=
                     m_generation) {
+
+                    m_job_pending =
+                        !m_jobs.empty();
+
                     continue;
                 }
 
-                // Sample-rate changes start a fresh overlap chain.
-                if (m_previous_rate != 0 &&
-                    m_previous_rate != source_rate) {
+                if (decoded &&
+                    separated &&
+                    vocals.size() ==
+                        input.size() &&
+                    instrumental.size() ==
+                        input.size()) {
 
-                    m_prev_original_tail.clear();
-                    m_prev_vocals_tail.clear();
-                    m_prev_instrumental_tail.clear();
-                    m_have_previous = false;
+                    const size_t frames =
+                        input.size() /
+                        kCacheChannels;
+
+                    const double duration =
+                        static_cast<double>(
+                            frames) /
+                        static_cast<double>(
+                            kCacheRate);
+
+                    cache_segment seg;
+                    seg.generation =
+                        job.generation;
+                    seg.start_seconds =
+                        job.start_seconds;
+                    seg.end_seconds =
+                        job.start_seconds +
+                        duration;
+
+                    seg.vocals =
+                        std::move(vocals);
+
+                    seg.instrumental =
+                        std::move(
+                            instrumental);
+
+                    // Keep only segments around the active timeline.
+                    while (!m_segments.empty() &&
+                           m_segments.front().
+                               end_seconds <
+                               m_anchor_seconds -
+                                   5.0) {
+
+                        m_segments.pop_front();
+                    }
+
+                    m_segments.push_back(
+                        std::move(seg));
                 }
 
-                const bool had_previous =
-                    m_have_previous;
-
-                split_hop_and_tail(
-                    current_job.samples,
-                    source_rate,
-                    m_prev_original_tail,
-                    had_previous,
-                    segment.original,
-                    segment.original_tail);
-
-                split_hop_and_tail(
-                    source_vocals,
-                    source_rate,
-                    m_prev_vocals_tail,
-                    had_previous,
-                    segment.vocals,
-                    segment.vocals_tail);
-
-                split_hop_and_tail(
-                    source_instrumental,
-                    source_rate,
-                    m_prev_instrumental_tail,
-                    had_previous,
-                    segment.instrumental,
-                    segment.instrumental_tail);
-
-                m_have_previous = true;
-                m_previous_rate = source_rate;
-
-                m_ready.emplace_back(
-                    std::move(segment));
+                m_job_pending =
+                    !m_jobs.empty();
             }
+        }
 
-            m_ready_cv.notify_one();
+        MFShutdown();
+
+        if (SUCCEEDED(chr)) {
+            CoUninitialize();
         }
     }
 
-    std::mutex m_mutex;
-    std::condition_variable m_job_cv;
-    std::condition_variable m_ready_cv;
-
-    std::deque<job> m_jobs;
-    std::deque<separated_segment> m_ready;
+    mutable std::mutex m_mutex;
+    std::condition_variable m_cv;
 
     std::thread m_thread;
     bool m_stop = false;
 
-    uint64_t m_generation = 0;
+    uint64_t m_generation = 1;
 
-    bool m_have_previous = false;
-    unsigned m_previous_rate = 0;
+    std::wstring m_path;
+    double m_anchor_seconds = 0.0;
 
-    std::vector<float> m_prev_original_tail;
-    std::vector<float> m_prev_vocals_tail;
-    std::vector<float> m_prev_instrumental_tail;
+    bool m_job_pending = false;
+
+    std::deque<cache_job> m_jobs;
+    std::deque<cache_segment> m_segments;
 };
 
-class stem_dsp : public dsp_impl_base {
+live_cache_manager& cache_manager() {
+    static live_cache_manager instance;
+    return instance;
+}
+
+class stem_playback_observer :
+    public play_callback_static {
 public:
-    explicit stem_dsp(dsp_preset const&)
-        : m_worker(std::make_unique<separator_worker>()) {}
+    unsigned get_flags() override {
+        return
+            flag_on_playback_new_track |
+            flag_on_playback_stop |
+            flag_on_playback_seek |
+            flag_on_playback_time;
+    }
+
+    void on_playback_starting(
+        play_control::t_track_command,
+        bool) override {}
+
+    void on_playback_new_track(
+        metadb_handle_ptr track) override {
+
+        cache_manager().new_track(
+            local_path_from_metadb(
+                track));
+    }
+
+    void on_playback_stop(
+        play_control::t_stop_reason) override {
+
+        cache_manager().stop();
+    }
+
+    void on_playback_seek(
+        double time) override {
+
+        cache_manager().seek(time);
+    }
+
+    void on_playback_pause(
+        bool) override {}
+
+    void on_playback_edited(
+        metadb_handle_ptr) override {}
+
+    void on_playback_dynamic_info(
+        const file_info&) override {}
+
+    void on_playback_dynamic_info_track(
+        const file_info&) override {}
+
+    void on_playback_time(
+        double time) override {
+
+        cache_manager().ensure_ahead(time);
+    }
+
+    void on_volume_change(
+        float) override {}
+};
+
+static play_callback_static_factory_t<
+    stem_playback_observer>
+    g_stem_playback_observer_factory;
+
+class stem_dsp :
+    public dsp_impl_base {
+public:
+    explicit stem_dsp(
+        dsp_preset const&) {}
 
     static GUID g_get_guid() {
         static const GUID guid =
-            {0x1fd7bdf4,0xa0e1,0x4b3e,{0x9b,0x5a,0x45,0xe6,0xba,0x88,0x34,0x22}};
+            {0x1fd7bdf4,0xa0e1,0x4b3e,
+             {0x9b,0x5a,0x45,0xe6,
+              0xba,0x88,0x34,0x22}};
+
         return guid;
     }
 
-    static void g_get_name(pfc::string_base& out) {
-        out = "Stem Separator (ONNX)";
+    static void g_get_name(
+        pfc::string_base& out) {
+
+        out =
+            "Stem Separator (ONNX)";
     }
 
-    static bool g_get_default_preset(dsp_preset& out) {
+    static bool g_get_default_preset(
+        dsp_preset& out) {
+
         dsp_preset_builder builder;
-        builder.finish(g_get_guid(), out);
+
+        builder.finish(
+            g_get_guid(),
+            out);
+
         return true;
     }
 
@@ -482,7 +962,9 @@ public:
         audio_chunk* chunk,
         abort_callback&) override {
 
-        if (!chunk || chunk->is_empty()) {
+        if (!chunk ||
+            chunk->is_empty()) {
+
             return false;
         }
 
@@ -492,121 +974,181 @@ public:
         const unsigned rate =
             chunk->get_srate();
 
-        const unsigned chan_config =
-            chunk->get_channel_config();
-
-        // V19 supports ordinary stereo sample rates. Mono/multichannel is
-        // still bypassed unchanged for this prototype.
-        if (channels != kChannels ||
-            rate < 8000 ||
-            rate > 384000) {
-
-            reset_state();
-            return true;
-        }
-
-        if (m_rate != 0 &&
-            (m_rate != rate ||
-             m_channels != channels ||
-             m_channel_config != chan_config)) {
-
-            reset_state();
-        }
-
-        m_rate = rate;
-        m_channels = channels;
-        m_channel_config = chan_config;
-
         const size_t frames =
             chunk->get_sample_count();
 
-        const size_t values =
-            frames * channels;
+        if (channels !=
+                kCacheChannels ||
+            rate == 0) {
 
-        const audio_sample* src =
+            reset_local();
+            return true;
+        }
+
+        const uint64_t gen =
+            cache_manager().
+                generation();
+
+        if (!m_have_position ||
+            gen != m_generation) {
+
+            m_generation = gen;
+
+            m_position_seconds =
+                cache_manager().
+                    anchor_time();
+
+            m_have_position = true;
+            m_using_stem = false;
+        }
+
+        const stemmode::mode mode =
+            stemmode::get();
+
+        if (mode ==
+            stemmode::mode::original) {
+
+            m_position_seconds +=
+                static_cast<double>(
+                    frames) /
+                static_cast<double>(
+                    rate);
+
+            m_using_stem = false;
+            return true;
+        }
+
+        // Keep the background reader fed. This call never waits.
+        cache_manager().ensure_ahead(
+            m_position_seconds);
+
+        std::vector<float> rendered;
+
+        const bool have_cache =
+            cache_manager().render(
+                mode,
+                m_position_seconds,
+                rate,
+                frames,
+                rendered);
+
+        const audio_sample* original =
             chunk->get_data();
 
-        const size_t old =
-            m_input.size();
+        if (!have_cache ||
+            rendered.size() !=
+                frames *
+                kCacheChannels) {
 
-        m_input.resize(old + values);
+            // Critical V23 behavior:
+            // NEVER stall foobar waiting for Spleeter.
+            // After a seek we temporarily play the original mix until
+            // the position-indexed cache catches up.
+            m_position_seconds +=
+                static_cast<double>(
+                    frames) /
+                static_cast<double>(
+                    rate);
 
-        for (size_t i = 0; i < values; ++i) {
-            m_input[old + i] =
-                static_cast<float>(src[i]);
+            m_using_stem = false;
+            return true;
         }
 
-        queue_available_windows();
+        std::vector<audio_sample> output(
+            rendered.size());
 
-        // V21: prime one full analysis window instead of two.
-        // This reduces visible playback delay while the worker still has
-        // ample CPU headroom on a fast machine.
-        if (!m_started &&
-            m_submitted >= 1) {
+        const size_t fade_frames =
+            static_cast<size_t>(
+                kSwitchFadeSeconds *
+                static_cast<double>(
+                    rate));
 
-            separated_segment first;
+        for (size_t f = 0;
+             f < frames;
+             ++f) {
 
-            if (m_worker->wait_pop(first)) {
-                emit_segment(first);
-                ++m_emitted;
-                m_started = true;
+            float mix = 1.0f;
 
-                // Do not artificially add a second priming wait. If another
-                // block has already completed it will be drained below.
+            if (!m_using_stem &&
+                fade_frames > 0 &&
+                f < fade_frames) {
+
+                mix =
+                    static_cast<float>(
+                        f + 1) /
+                    static_cast<float>(
+                        fade_frames);
+            }
+
+            for (unsigned ch = 0;
+                 ch < kCacheChannels;
+                 ++ch) {
+
+                const size_t i =
+                    f *
+                        kCacheChannels +
+                    ch;
+
+                const float stem_sample =
+                    rendered[i];
+
+                const float original_sample =
+                    static_cast<float>(
+                        original[i]);
+
+                const float v =
+                    original_sample *
+                        (1.0f - mix) +
+                    stem_sample *
+                        mix;
+
+                output[i] =
+                    static_cast<audio_sample>(
+                        v);
             }
         }
 
-        if (m_started) {
-            separated_segment ready;
+        chunk->set_data(
+            output.data(),
+            frames,
+            channels,
+            rate,
+            chunk->get_channel_config());
 
-            // Drain everything already completed first.
-            while (m_worker->try_pop(ready)) {
-                emit_segment(ready);
-                ++m_emitted;
-            }
+        m_using_stem = true;
 
-            // V22 BACK-PRESSURE:
-            //
-            // Never allow foobar's decoder/playback timeline to run far ahead
-            // of the processed audio we actually return. V21 could consume
-            // incoming PCM immediately while the worker was still separating
-            // earlier windows. That let seekbars/playback position race
-            // forward even though audible playback was still behind.
-            //
-            // Keep at most one submitted analysis window outstanding.
-            if (m_submitted > m_emitted + 1) {
-                if (m_worker->wait_pop(ready)) {
-                    emit_segment(ready);
-                    ++m_emitted;
-                }
-            }
-        }
+        m_position_seconds +=
+            static_cast<double>(
+                frames) /
+            static_cast<double>(
+                rate);
 
-        return false;
+        return true;
     }
 
     void on_endofplayback(
         abort_callback&) override {
 
-        drain_submitted_and_tail();
-        reset_state();
+        reset_local();
     }
 
     void on_endoftrack(
         abort_callback&) override {
 
-        drain_submitted_and_tail();
-        reset_state();
+        reset_local();
     }
 
     void flush() override {
-        reset_state();
+        // Do not stop/join the background cache worker here.
+        // A seek callback has already changed its generation and target.
+        // We only reset this DSP instance's local timeline.
+        m_have_position = false;
+        m_using_stem = false;
     }
 
     double get_latency() override {
-        // One full analysis window is buffered before the first processed
-        // samples are emitted.
-        return kWindowSeconds;
+        // V23 deliberately adds no DSP pipeline latency.
+        return 0.0;
     }
 
     bool need_track_change_mark() override {
@@ -614,197 +1156,18 @@ public:
     }
 
 private:
-    void queue_available_windows() {
-        const size_t win_frames =
-            frames_for(kWindowSeconds, m_rate);
-
-        const size_t ov_frames =
-            frames_for(kOverlapSeconds, m_rate);
-
-        const size_t hp_frames =
-            win_frames - ov_frames;
-
-        const size_t win_values =
-            win_frames * kChannels;
-
-        const size_t hop_values =
-            hp_frames * kChannels;
-
-        while (m_input.size() >= win_values) {
-            std::vector<float> window(
-                m_input.begin(),
-                m_input.begin() +
-                    static_cast<std::ptrdiff_t>(
-                        win_values));
-
-            m_worker->submit(
-                std::move(window),
-                m_rate);
-
-            ++m_submitted;
-
-            m_input.erase(
-                m_input.begin(),
-                m_input.begin() +
-                    static_cast<std::ptrdiff_t>(
-                        hop_values));
-        }
+    void reset_local() {
+        m_have_position = false;
+        m_using_stem = false;
+        m_position_seconds = 0.0;
+        m_generation = 0;
     }
 
-    const std::vector<float>& choose(
-        const separated_segment& segment,
-        bool tail) const {
+    bool m_have_position = false;
+    bool m_using_stem = false;
 
-        switch (stemmode::get()) {
-        case stemmode::mode::vocals:
-            return tail
-                ? segment.vocals_tail
-                : segment.vocals;
-
-        case stemmode::mode::instrumental:
-            return tail
-                ? segment.instrumental_tail
-                : segment.instrumental;
-
-        case stemmode::mode::original:
-        default:
-            return tail
-                ? segment.original_tail
-                : segment.original;
-        }
-    }
-
-    void emit_segment(
-        const separated_segment& segment) {
-
-        emit_float_audio(
-            choose(segment, false));
-
-        m_last_segment = segment;
-        m_have_last_segment = true;
-    }
-
-    void drain_submitted_and_tail() {
-        while (m_emitted < m_submitted) {
-            separated_segment ready;
-
-            if (!m_worker->wait_pop(ready)) {
-                break;
-            }
-
-            emit_segment(ready);
-            ++m_emitted;
-        }
-
-        const size_t overlap_values =
-            m_rate != 0
-                ? frames_for(
-                    kOverlapSeconds,
-                    m_rate) * kChannels
-                : 0;
-
-        // Emit the final processed overlap exactly once.
-        if (m_have_last_segment) {
-            emit_float_audio(
-                choose(
-                    m_last_segment,
-                    true));
-        }
-
-        // m_input begins with the same overlap already represented by the
-        // final processed tail. Emit only true residual audio after it.
-        size_t skip = 0;
-
-        if (m_have_last_segment) {
-            skip =
-                overlap_values < m_input.size()
-                    ? overlap_values
-                    : m_input.size();
-        }
-
-        if (m_input.size() > skip) {
-            std::vector<float> residual(
-                m_input.begin() +
-                    static_cast<std::ptrdiff_t>(skip),
-                m_input.end());
-
-            emit_float_audio(residual);
-        }
-    }
-
-    void emit_float_audio(
-        const std::vector<float>& samples) {
-
-        if (samples.empty() ||
-            m_rate == 0) {
-            return;
-        }
-
-        const size_t frames =
-            samples.size() / kChannels;
-
-        std::vector<audio_sample> fb(
-            samples.size());
-
-        for (size_t i = 0;
-             i < samples.size();
-             ++i) {
-
-            fb[i] =
-                static_cast<audio_sample>(
-                    samples[i]);
-        }
-
-        audio_chunk* out =
-            insert_chunk(fb.size());
-
-        out->set_data(
-            fb.data(),
-            frames,
-            kChannels,
-            m_rate,
-            m_channel_config);
-    }
-
-    void reset_state() {
-        // V21 SEEK-SAFETY:
-        // Do not merely invalidate queued jobs. A seek/flush must guarantee
-        // that no worker from the old timeline can later publish audio.
-        //
-        // Destroying separator_worker signals stop and joins its thread,
-        // including any inference currently in progress. Only after that
-        // thread is gone do we create a clean worker for the new timeline.
-        m_worker.reset();
-        m_worker = std::make_unique<separator_worker>();
-
-        m_input.clear();
-
-        m_submitted = 0;
-        m_emitted = 0;
-        m_started = false;
-
-        m_have_last_segment = false;
-        m_last_segment = separated_segment{};
-
-        m_rate = 0;
-        m_channels = 0;
-        m_channel_config = 0;
-    }
-
-    std::unique_ptr<separator_worker> m_worker;
-    std::vector<float> m_input;
-
-    size_t m_submitted = 0;
-    size_t m_emitted = 0;
-
-    bool m_started = false;
-
-    bool m_have_last_segment = false;
-    separated_segment m_last_segment;
-
-    unsigned m_rate = 0;
-    unsigned m_channels = 0;
-    unsigned m_channel_config = 0;
+    uint64_t m_generation = 0;
+    double m_position_seconds = 0.0;
 };
 
 static dsp_factory_t<stem_dsp>
