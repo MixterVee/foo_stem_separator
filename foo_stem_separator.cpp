@@ -38,9 +38,9 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "1.1.0 seek-safe bridge + whole-track WAV export",
+    "1.2.0 seek-safe back-pressure + whole-track WAV export",
     "Native ONNX vocals / instrumental separation.\n"
-    "Seek-safe live worker lifecycle plus whole-track WAV export.\n"
+    "Seek-safe bounded live worker plus whole-track WAV export.\n"
     "Export uses one Spleeter inference for the entire decoded track—no stitched windows."
 );
 

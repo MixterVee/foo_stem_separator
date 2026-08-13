@@ -550,15 +550,35 @@ public:
                 emit_segment(first);
                 ++m_emitted;
                 m_started = true;
+
+                // Do not artificially add a second priming wait. If another
+                // block has already completed it will be drained below.
             }
         }
 
         if (m_started) {
             separated_segment ready;
 
+            // Drain everything already completed first.
             while (m_worker->try_pop(ready)) {
                 emit_segment(ready);
                 ++m_emitted;
+            }
+
+            // V22 BACK-PRESSURE:
+            //
+            // Never allow foobar's decoder/playback timeline to run far ahead
+            // of the processed audio we actually return. V21 could consume
+            // incoming PCM immediately while the worker was still separating
+            // earlier windows. That let seekbars/playback position race
+            // forward even though audible playback was still behind.
+            //
+            // Keep at most one submitted analysis window outstanding.
+            if (m_submitted > m_emitted + 1) {
+                if (m_worker->wait_pop(ready)) {
+                    emit_segment(ready);
+                    ++m_emitted;
+                }
             }
         }
 
