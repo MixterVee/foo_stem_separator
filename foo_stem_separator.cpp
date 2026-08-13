@@ -4,9 +4,9 @@
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "0.3.0 async ONNX prototype",
+    "0.4.0 safe overlap prototype",
     "Native ONNX vocals / instrumental separation.\n"
-    "V13: background worker, 2-second windows, 0.5-second overlap/crossfade.\n"
+    "V14: synchronized DSP, 2-second windows, 0.5-second overlap/crossfade.\n"
     "Prototype currently supports stereo 44.1 kHz."
 );
 
@@ -23,9 +23,7 @@ public:
         cmd_count
     };
 
-    unsigned get_num_items() override {
-        return cmd_count;
-    }
+    unsigned get_num_items() override { return cmd_count; }
 
     void get_item_name(unsigned index, pfc::string_base& out) override {
         switch (index) {
@@ -50,7 +48,6 @@ public:
             {0xa92a1002,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x02}},
             {0xa92a1003,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x03}}
         };
-
         return ids[index < cmd_count ? index : 0];
     }
 
@@ -78,22 +75,18 @@ public:
         metadb_handle_list_cref,
         const GUID&) override {
 
-        stemmode::mode next =
-            stemmode::mode::original;
+        stemmode::mode next = stemmode::mode::original;
 
         if (index == cmd_vocals) {
             next = stemmode::mode::vocals;
-        }
-        else if (index == cmd_instrumental) {
+        } else if (index == cmd_instrumental) {
             next = stemmode::mode::instrumental;
         }
 
         stemmode::set(next);
 
         pfc::string_formatter msg;
-        msg << "Stem Separator mode: "
-            << stemmode::name(next);
-
+        msg << "Stem Separator mode: " << stemmode::name(next);
         console::print(msg);
     }
 };
