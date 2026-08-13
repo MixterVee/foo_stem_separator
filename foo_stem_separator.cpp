@@ -220,10 +220,6 @@ bool decode_audio_file(
         return false;
     }
 
-    attrs->SetUINT32(
-        MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING,
-        TRUE);
-
     ComPtr<IMFSourceReader> reader;
 
     hr = MFCreateSourceReaderFromURL(

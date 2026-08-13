@@ -221,8 +221,13 @@ private:
         const float delta_left = m_last_left - samples[0];
         const float delta_right = m_last_right - samples[1];
 
+        const float abs_left = std::fabs(delta_left);
+        const float abs_right = std::fabs(delta_right);
+
         const float peak_jump =
-            std::max(std::fabs(delta_left), std::fabs(delta_right));
+            abs_left > abs_right
+                ? abs_left
+                : abs_right;
 
         // Don't touch clean boundaries. Only correct discontinuities large
         // enough to plausibly create a click.
