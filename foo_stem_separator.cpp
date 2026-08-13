@@ -38,10 +38,10 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "0.7.0 micro-smoothed + WAV export",
+    "0.9.0 multi-rate + clean WAV export",
     "Native ONNX vocals / instrumental separation.\n"
     "V16: smoother 4-second playback windows with 1.5-second overlap,\n"
-    "3 ms boundary smoothing + 15 ms large-jump de-clicking, plus WAV export."
+    "thresholded 10 ms de-clicking, plus Save Vocals/Instrumental as WAV."
 );
 
 VALIDATE_COMPONENT_FILENAME("foo_stem_separator.dll");
@@ -391,6 +391,8 @@ bool separate_for_export(
         return false;
     }
 
+    // Export uses the same overlap logic that proved clean in live playback,
+    // but with larger 12-second windows for more model context.
     const size_t window_frames =
         static_cast<size_t>(
             kExportRate * kExportWindowSeconds);
@@ -402,33 +404,31 @@ bool separate_for_export(
     const size_t hop_frames =
         window_frames - overlap_frames;
 
-    output.assign(input.size(), 0.0f);
-    std::vector<float> weights(total_frames, 0.0f);
+    const size_t window_values =
+        window_frames * kExportChannels;
+
+    const size_t hop_values =
+        hop_frames * kExportChannels;
+
+    std::vector<float> working = input;
+
+    std::vector<float> previous_tail;
+    bool have_previous = false;
+
+    output.clear();
+    output.reserve(input.size());
 
     onnxstem::engine engine;
 
-    for (size_t start = 0;
-         start < total_frames;
-         start += hop_frames) {
+    size_t offset_values = 0;
 
-        const size_t available =
-            total_frames - start;
-
-        const size_t actual_frames =
-            (std::min)(window_frames, available);
-
+    while (working.size() - offset_values >= window_values) {
         std::vector<float> window(
-            window_frames * kExportChannels,
-            0.0f);
-
-        const size_t copy_values =
-            actual_frames * kExportChannels;
-
-        std::copy_n(
-            input.data() +
-                start * kExportChannels,
-            copy_values,
-            window.data());
+            working.begin() +
+                static_cast<std::ptrdiff_t>(offset_values),
+            working.begin() +
+                static_cast<std::ptrdiff_t>(
+                    offset_values + window_values));
 
         std::vector<float> vocals;
         std::vector<float> instrumental;
@@ -453,19 +453,22 @@ bool separate_for_export(
                 ? vocals
                 : instrumental;
 
-        const bool first =
-            start == 0;
+        if (!have_previous) {
+            output.insert(
+                output.end(),
+                stem.begin(),
+                stem.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        hop_values));
+        }
+        else {
+            constexpr double kHalfPi =
+                1.57079632679489661923;
 
-        const bool last =
-            start + actual_frames >= total_frames;
+            for (size_t f = 0;
+                 f < overlap_frames;
+                 ++f) {
 
-        for (size_t f = 0;
-             f < actual_frames;
-             ++f) {
-
-            float w = 1.0f;
-
-            if (!first && f < overlap_frames) {
                 const double t =
                     overlap_frames > 1
                         ? static_cast<double>(f) /
@@ -473,67 +476,87 @@ bool separate_for_export(
                                 overlap_frames - 1)
                         : 1.0;
 
-                const double s =
-                    std::sin(
-                        1.57079632679489661923 * t);
-
-                w *= static_cast<float>(s * s);
-            }
-
-            if (!last &&
-                f >= actual_frames - overlap_frames) {
-
-                const size_t from_end =
-                    actual_frames - 1 - f;
-
-                const double t =
-                    overlap_frames > 1
-                        ? static_cast<double>(from_end) /
-                            static_cast<double>(
-                                overlap_frames - 1)
-                        : 1.0;
+                const double c =
+                    std::cos(kHalfPi * t);
 
                 const double s =
-                    std::sin(
-                        1.57079632679489661923 * t);
+                    std::sin(kHalfPi * t);
 
-                w *= static_cast<float>(s * s);
+                const float a =
+                    static_cast<float>(c * c);
+
+                const float b =
+                    static_cast<float>(s * s);
+
+                for (size_t ch = 0;
+                     ch < kExportChannels;
+                     ++ch) {
+
+                    const size_t i =
+                        f * kExportChannels + ch;
+
+                    output.push_back(
+                        previous_tail[i] * a +
+                        stem[i] * b);
+                }
             }
 
-            const size_t global_frame =
-                start + f;
+            const size_t start =
+                overlap_frames * kExportChannels;
 
-            if (global_frame >= total_frames) {
-                break;
-            }
-
-            weights[global_frame] += w;
-
-            output[
-                global_frame * kExportChannels
-            ] +=
-                stem[f * kExportChannels] * w;
-
-            output[
-                global_frame * kExportChannels + 1
-            ] +=
-                stem[f * kExportChannels + 1] * w;
+            output.insert(
+                output.end(),
+                stem.begin() +
+                    static_cast<std::ptrdiff_t>(start),
+                stem.begin() +
+                    static_cast<std::ptrdiff_t>(
+                        hop_values));
         }
 
-        if (last) break;
+        previous_tail.assign(
+            stem.begin() +
+                static_cast<std::ptrdiff_t>(
+                    hop_values),
+            stem.end());
+
+        have_previous = true;
+        offset_values += hop_values;
     }
 
-    for (size_t f = 0;
-         f < total_frames;
-         ++f) {
+    if (have_previous) {
+        output.insert(
+            output.end(),
+            previous_tail.begin(),
+            previous_tail.end());
+    }
 
-        const float w =
-            weights[f] > 1.0e-8f
-                ? weights[f]
-                : 1.0f;
+    // Skip the input overlap already represented by previous_tail and append
+    // only any true source residual shorter than a full analysis window.
+    size_t residual_start =
+        offset_values;
 
-        output[f * kExportChannels] /= w;
-        output[f * kExportChannels + 1] /= w;
+    if (have_previous) {
+        residual_start +=
+            overlap_frames * kExportChannels;
+    }
+
+    if (residual_start < input.size()) {
+        output.insert(
+            output.end(),
+            input.begin() +
+                static_cast<std::ptrdiff_t>(
+                    residual_start),
+            input.end());
+    }
+
+    // Keep file duration/sample count exactly aligned with the source decode.
+    if (output.size() > input.size()) {
+        output.resize(input.size());
+    }
+    else if (output.size() < input.size()) {
+        output.resize(
+            input.size(),
+            0.0f);
     }
 
     return true;
