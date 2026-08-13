@@ -1,14 +1,13 @@
 #include <foobar2000/SDK/foobar2000.h>
-#include <windows.h>
 
 #include "stem_mode.h"
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "0.2.0 ONNX prototype",
+    "0.3.0 async ONNX prototype",
     "Native ONNX vocals / instrumental separation.\n"
-    "Uses sherpa-onnx + Spleeter 2-stem models.\n"
-    "Prototype: stereo 44.1 kHz, 1-second internal blocks."
+    "V13: background worker, 2-second windows, 0.5-second overlap/crossfade.\n"
+    "Prototype currently supports stereo 44.1 kHz."
 );
 
 VALIDATE_COMPONENT_FILENAME("foo_stem_separator.dll");
@@ -51,6 +50,7 @@ public:
             {0xa92a1002,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x02}},
             {0xa92a1003,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x03}}
         };
+
         return ids[index < cmd_count ? index : 0];
     }
 
@@ -69,6 +69,7 @@ public:
             out = "Play the Spleeter accompaniment stem.";
             return true;
         }
+
         return false;
     }
 
@@ -77,7 +78,8 @@ public:
         metadb_handle_list_cref,
         const GUID&) override {
 
-        stemmode::mode next = stemmode::mode::original;
+        stemmode::mode next =
+            stemmode::mode::original;
 
         if (index == cmd_vocals) {
             next = stemmode::mode::vocals;
@@ -89,7 +91,9 @@ public:
         stemmode::set(next);
 
         pfc::string_formatter msg;
-        msg << "Stem Separator mode: " << stemmode::name(next);
+        msg << "Stem Separator mode: "
+            << stemmode::name(next);
+
         console::print(msg);
     }
 };

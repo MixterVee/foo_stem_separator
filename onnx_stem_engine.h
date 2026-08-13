@@ -1,9 +1,7 @@
 #pragma once
-#include <cstdint>
+#include <cstddef>
 #include <string>
 #include <vector>
-
-#include "stem_mode.h"
 
 namespace onnxstem {
 
@@ -18,13 +16,15 @@ public:
     bool ready();
     const std::wstring& last_error() const noexcept { return m_error; }
 
-    bool process_interleaved(
+    // Separates one stereo 44.1-kHz interleaved block and returns BOTH stems
+    // from a single sherpa-onnx inference call.
+    bool process_both(
         const float* input,
         size_t frames,
         unsigned channels,
         unsigned sample_rate,
-        stemmode::mode mode,
-        std::vector<float>& output);
+        std::vector<float>& vocals,
+        std::vector<float>& instrumental);
 
 private:
     bool initialize();
@@ -35,8 +35,6 @@ private:
     std::wstring vocals_model_path() const;
     std::wstring accompaniment_model_path() const;
 
-    // Keep Windows types out of this header so windows.h is not pulled in
-    // before the foobar2000 SDK / Winsock2 headers.
     void* m_module = nullptr;
     const void* m_separator = nullptr;
     bool m_attempted = false;

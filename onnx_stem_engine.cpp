@@ -1,5 +1,3 @@
-// IMPORTANT: foobar2000 SDK must be included before windows.h.
-// This prevents the legacy winsock.h / winsock2.h collision.
 #include <foobar2000/SDK/foobar2000.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -73,7 +71,6 @@ std::wstring utf8_to_wide(const char* s) {
     if (n <= 1) return {};
 
     std::vector<wchar_t> temp(static_cast<size_t>(n));
-
     MultiByteToWideChar(
         CP_UTF8, 0, s, -1, temp.data(), n);
 
@@ -84,38 +81,47 @@ std::string wide_to_utf8(const std::wstring& s) {
     if (s.empty()) return {};
 
     const int n = WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        s.c_str(),
+        CP_UTF8, 0, s.c_str(),
         static_cast<int>(s.size()),
-        nullptr,
-        0,
-        nullptr,
-        nullptr);
+        nullptr, 0, nullptr, nullptr);
 
     std::string out(static_cast<size_t>(n), '\0');
 
     WideCharToMultiByte(
-        CP_UTF8,
-        0,
-        s.c_str(),
+        CP_UTF8, 0, s.c_str(),
         static_cast<int>(s.size()),
-        out.data(),
-        n,
-        nullptr,
-        nullptr);
+        out.data(), n, nullptr, nullptr);
 
     return out;
 }
 
 std::wstring strip_file_scheme(std::wstring s) {
     const std::wstring prefix = L"file://";
-
     if (s.rfind(prefix, 0) == 0) {
         s.erase(0, prefix.size());
     }
-
     return s;
+}
+
+void copy_stem_interleaved(
+    const Stem& stem,
+    size_t requested_frames,
+    std::vector<float>& out) {
+
+    const size_t n = std::min<size_t>(
+        requested_frames,
+        stem.n > 0 ? static_cast<size_t>(stem.n) : 0);
+
+    out.assign(requested_frames * 2, 0.0f);
+
+    if (stem.num_channels < 2 || !stem.samples) {
+        return;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        out[i * 2] = stem.samples[0][i];
+        out[i * 2 + 1] = stem.samples[1][i];
+    }
 }
 
 } // namespace
@@ -141,7 +147,6 @@ std::wstring engine::component_directory() const {
             utf8_to_wide(core_api::get_my_full_path()));
 
     if (path.empty()) return {};
-
     return fs::path(path).parent_path().wstring();
 }
 
@@ -177,7 +182,6 @@ bool engine::ready() {
 bool engine::initialize() {
     if (m_separator) return true;
     if (m_attempted) return false;
-
     m_attempted = true;
 
     const auto dll = dll_path();
@@ -185,16 +189,12 @@ bool engine::initialize() {
     const auto accomp = accompaniment_model_path();
 
     if (!fs::exists(dll)) {
-        m_error =
-            L"Missing sherpa-onnx-c-api.dll next to the component.";
+        m_error = L"Missing sherpa-onnx-c-api.dll next to the component.";
         return false;
     }
 
-    if (!fs::exists(vocals) ||
-        !fs::exists(accomp)) {
-
-        m_error =
-            L"Missing Spleeter ONNX model files under models\\spleeter.";
+    if (!fs::exists(vocals) || !fs::exists(accomp)) {
+        m_error = L"Missing Spleeter ONNX model files under models\\spleeter.";
         return false;
     }
 
@@ -215,29 +215,25 @@ bool engine::initialize() {
 
     auto api_ptr = std::make_unique<engine::api>();
 
-    api_ptr->create =
-        reinterpret_cast<CreateFn>(
-            GetProcAddress(
-                module,
-                "SherpaOnnxCreateOfflineSourceSeparation"));
+    api_ptr->create = reinterpret_cast<CreateFn>(
+        GetProcAddress(
+            module,
+            "SherpaOnnxCreateOfflineSourceSeparation"));
 
-    api_ptr->destroy =
-        reinterpret_cast<DestroyFn>(
-            GetProcAddress(
-                module,
-                "SherpaOnnxDestroyOfflineSourceSeparation"));
+    api_ptr->destroy = reinterpret_cast<DestroyFn>(
+        GetProcAddress(
+            module,
+            "SherpaOnnxDestroyOfflineSourceSeparation"));
 
-    api_ptr->process =
-        reinterpret_cast<ProcessFn>(
-            GetProcAddress(
-                module,
-                "SherpaOnnxOfflineSourceSeparationProcess"));
+    api_ptr->process = reinterpret_cast<ProcessFn>(
+        GetProcAddress(
+            module,
+            "SherpaOnnxOfflineSourceSeparationProcess"));
 
-    api_ptr->destroy_output =
-        reinterpret_cast<DestroyOutputFn>(
-            GetProcAddress(
-                module,
-                "SherpaOnnxDestroySourceSeparationOutput"));
+    api_ptr->destroy_output = reinterpret_cast<DestroyOutputFn>(
+        GetProcAddress(
+            module,
+            "SherpaOnnxDestroySourceSeparationOutput"));
 
     if (!api_ptr->create ||
         !api_ptr->destroy ||
@@ -252,38 +248,27 @@ bool engine::initialize() {
         return false;
     }
 
-    const std::string vocals8 =
-        wide_to_utf8(vocals);
-
-    const std::string accomp8 =
-        wide_to_utf8(accomp);
+    const std::string vocals8 = wide_to_utf8(vocals);
+    const std::string accomp8 = wide_to_utf8(accomp);
 
     SeparationConfig config{};
-
-    config.model.spleeter.vocals =
-        vocals8.c_str();
-
-    config.model.spleeter.accompaniment =
-        accomp8.c_str();
-
+    config.model.spleeter.vocals = vocals8.c_str();
+    config.model.spleeter.accompaniment = accomp8.c_str();
     config.model.num_threads = 2;
     config.model.debug = 0;
     config.model.provider = "cpu";
 
-    m_separator =
-        api_ptr->create(&config);
+    m_separator = api_ptr->create(&config);
 
     if (!m_separator) {
         m_error =
             L"Sherpa-onnx could not create the Spleeter separation engine.";
-
         FreeLibrary(module);
         m_module = nullptr;
         return false;
     }
 
     m_api = api_ptr.release();
-
     return true;
 }
 
@@ -298,46 +283,31 @@ void engine::shutdown() {
     m_api = nullptr;
 
     if (m_module) {
-        FreeLibrary(
-            static_cast<HMODULE>(m_module));
+        FreeLibrary(static_cast<HMODULE>(m_module));
         m_module = nullptr;
     }
 }
 
-bool engine::process_interleaved(
+bool engine::process_both(
     const float* input,
     size_t frames,
     unsigned channels,
     unsigned sample_rate,
-    stemmode::mode mode,
-    std::vector<float>& output) {
+    std::vector<float>& vocals,
+    std::vector<float>& instrumental) {
 
-    output.clear();
+    vocals.clear();
+    instrumental.clear();
 
-    if (!input ||
-        frames == 0 ||
-        channels == 0) {
-        return false;
-    }
+    if (!input || frames == 0) return false;
 
-    if (mode == stemmode::mode::original) {
-        output.assign(
-            input,
-            input + frames * channels);
-        return true;
-    }
-
-    if (channels != 2 ||
-        sample_rate != 44100) {
-
+    if (channels != 2 || sample_rate != 44100) {
         m_error =
             L"ONNX prototype currently supports stereo 44.1 kHz audio only.";
         return false;
     }
 
-    if (!initialize()) {
-        return false;
-    }
+    if (!initialize()) return false;
 
     std::vector<float> left(frames);
     std::vector<float> right(frames);
@@ -366,45 +336,25 @@ bool engine::process_interleaved(
         return false;
     }
 
-    const int stem_index =
-        mode == stemmode::mode::vocals
-            ? 0
-            : 1;
-
     bool ok = false;
 
-    if (result->num_stems > stem_index &&
+    if (result->num_stems >= 2 &&
         result->sample_rate ==
             static_cast<int32_t>(sample_rate)) {
 
-        const Stem& stem =
-            result->stems[stem_index];
+        copy_stem_interleaved(
+            result->stems[0],
+            frames,
+            vocals);
 
-        if (stem.num_channels >= 2 &&
-            stem.n > 0) {
+        copy_stem_interleaved(
+            result->stems[1],
+            frames,
+            instrumental);
 
-            const size_t out_frames =
-                std::min<size_t>(
-                    frames,
-                    static_cast<size_t>(stem.n));
-
-            output.resize(
-                frames * 2,
-                0.0f);
-
-            for (size_t i = 0;
-                 i < out_frames;
-                 ++i) {
-
-                output[i * 2] =
-                    stem.samples[0][i];
-
-                output[i * 2 + 1] =
-                    stem.samples[1][i];
-            }
-
-            ok = true;
-        }
+        ok =
+            vocals.size() == frames * 2 &&
+            instrumental.size() == frames * 2;
     }
 
     m_api->destroy_output(result);
