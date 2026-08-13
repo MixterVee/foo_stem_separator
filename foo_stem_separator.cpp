@@ -38,9 +38,9 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "1.3.0 position-cache live + whole-track WAV export",
+    "1.4.0 cache-margin live + whole-track WAV export",
     "Native ONNX vocals / instrumental separation.\n"
-    "Zero-latency position-cache live playback plus whole-track WAV export.\n"
+    "Zero-latency position-cache playback with wider cache overlap plus whole-track WAV export.\n"
     "Live stems use independent read-ahead caching; export uses whole-track Spleeter inference."
 );
 

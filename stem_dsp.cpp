@@ -42,9 +42,9 @@ namespace {
 constexpr unsigned kCacheRate = 44100;
 constexpr unsigned kCacheChannels = 2;
 
-constexpr double kCacheSeconds = 30.0;
-constexpr double kCacheOverlapSeconds = 1.0;
-constexpr double kPrefetchSeconds = 10.0;
+constexpr double kCacheSeconds = 20.0;
+constexpr double kCacheOverlapSeconds = 3.0;
+constexpr double kPrefetchSeconds = 20.0;
 constexpr double kSwitchFadeSeconds = 0.050;
 
 std::wstring utf8_to_wide_cache(const char* s) {
