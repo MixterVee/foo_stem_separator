@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -449,7 +450,8 @@ private:
 
 class stem_dsp : public dsp_impl_base {
 public:
-    explicit stem_dsp(dsp_preset const&) {}
+    explicit stem_dsp(dsp_preset const&)
+        : m_worker(std::make_unique<separator_worker>()) {}
 
     static GUID g_get_guid() {
         static const GUID guid =
@@ -536,13 +538,15 @@ public:
 
         queue_available_windows();
 
-        // Two windows of priming gives the worker a full hop of headroom.
+        // V21: prime one full analysis window instead of two.
+        // This reduces visible playback delay while the worker still has
+        // ample CPU headroom on a fast machine.
         if (!m_started &&
-            m_submitted >= 2) {
+            m_submitted >= 1) {
 
             separated_segment first;
 
-            if (m_worker.wait_pop(first)) {
+            if (m_worker->wait_pop(first)) {
                 emit_segment(first);
                 ++m_emitted;
                 m_started = true;
@@ -552,7 +556,7 @@ public:
         if (m_started) {
             separated_segment ready;
 
-            while (m_worker.try_pop(ready)) {
+            while (m_worker->try_pop(ready)) {
                 emit_segment(ready);
                 ++m_emitted;
             }
@@ -580,15 +584,9 @@ public:
     }
 
     double get_latency() override {
-        if (m_rate == 0) {
-            return
-                kWindowSeconds +
-                (kWindowSeconds - kOverlapSeconds);
-        }
-
-        return
-            kWindowSeconds +
-            (kWindowSeconds - kOverlapSeconds);
+        // One full analysis window is buffered before the first processed
+        // samples are emitted.
+        return kWindowSeconds;
     }
 
     bool need_track_change_mark() override {
@@ -619,7 +617,7 @@ private:
                     static_cast<std::ptrdiff_t>(
                         win_values));
 
-            m_worker.submit(
+            m_worker->submit(
                 std::move(window),
                 m_rate);
 
@@ -670,7 +668,7 @@ private:
         while (m_emitted < m_submitted) {
             separated_segment ready;
 
-            if (!m_worker.wait_pop(ready)) {
+            if (!m_worker->wait_pop(ready)) {
                 break;
             }
 
@@ -749,7 +747,15 @@ private:
     }
 
     void reset_state() {
+        // V21 SEEK-SAFETY:
+        // Do not merely invalidate queued jobs. A seek/flush must guarantee
+        // that no worker from the old timeline can later publish audio.
+        //
+        // Destroying separator_worker signals stop and joins its thread,
+        // including any inference currently in progress. Only after that
+        // thread is gone do we create a clean worker for the new timeline.
         m_worker.reset();
+        m_worker = std::make_unique<separator_worker>();
 
         m_input.clear();
 
@@ -765,7 +771,7 @@ private:
         m_channel_config = 0;
     }
 
-    separator_worker m_worker;
+    std::unique_ptr<separator_worker> m_worker;
     std::vector<float> m_input;
 
     size_t m_submitted = 0;
