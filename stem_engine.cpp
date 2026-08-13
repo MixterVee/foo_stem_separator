@@ -124,9 +124,9 @@ static result run_demucs(const std::wstring& sourcePath, stem_kind kind) {
 
     fs::create_directories(r.cache_dir);
 
-    // py.exe is used so normal Windows Python installations are found.
+    // Use the Python command available on this Windows system.
     std::wstring cmd =
-        L"py -m demucs --two-stems=vocals -n htdemucs -o " +
+        L"python -m demucs --two-stems=vocals -n htdemucs -o " +
         quote(r.cache_dir) + L" " + quote(sourcePath);
 
     std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
