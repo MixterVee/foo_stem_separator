@@ -38,10 +38,10 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "0.6.0 smooth + WAV export",
+    "0.7.0 micro-smoothed + WAV export",
     "Native ONNX vocals / instrumental separation.\n"
     "V16: smoother 4-second playback windows with 1.5-second overlap,\n"
-    "thresholded 10 ms de-clicking, plus Save Vocals/Instrumental as WAV."
+    "3 ms boundary smoothing + 15 ms large-jump de-clicking, plus WAV export."
 );
 
 VALIDATE_COMPONENT_FILENAME("foo_stem_separator.dll");

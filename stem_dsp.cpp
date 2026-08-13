@@ -11,8 +11,9 @@ namespace {
 
 constexpr double kWindowSeconds = 4.0;
 constexpr double kOverlapSeconds = 1.5;
-constexpr double kDeclickSeconds = 0.010; // 10 ms
+constexpr double kDeclickSeconds = 0.015; // 15 ms for larger discontinuities
 constexpr float kDeclickThreshold = 0.0125f;
+constexpr double kMicroSmoothSeconds = 0.003; // 3 ms on every boundary
 
 constexpr unsigned kRate = 44100;
 constexpr unsigned kChannels = 2;
@@ -229,26 +230,54 @@ private:
                 ? abs_left
                 : abs_right;
 
-        // Don't touch clean boundaries. Only correct discontinuities large
-        // enough to plausibly create a click.
-        if (peak_jump >= kDeclickThreshold) {
-            const size_t ramp_frames =
-                std::min<size_t>(
-                    frames,
-                    static_cast<size_t>(kRate * kDeclickSeconds));
+        // Always smooth the very first few milliseconds of every emitted
+        // segment. This targets rare low-level digital ticks without changing
+        // the main overlap-add shape.
+        size_t micro_frames =
+            static_cast<size_t>(kRate * kMicroSmoothSeconds);
 
-            for (size_t f = 0; f < ramp_frames; ++f) {
-                const float t =
-                    ramp_frames > 1
-                        ? static_cast<float>(f) /
-                            static_cast<float>(ramp_frames - 1)
+        if (micro_frames > frames) {
+            micro_frames = frames;
+        }
+
+        for (size_t f = 0; f < micro_frames; ++f) {
+            const float t =
+                micro_frames > 1
+                    ? static_cast<float>(f) /
+                        static_cast<float>(micro_frames - 1)
+                    : 1.0f;
+
+            const float w =
+                0.5f * (1.0f + std::cos(
+                    static_cast<float>(
+                        3.14159265358979323846 * t)));
+
+            samples[f * kChannels] += delta_left * w;
+            samples[f * kChannels + 1] += delta_right * w;
+        }
+
+        // If the jump is unusually large, extend the same correction farther
+        // into the segment with a 15 ms envelope.
+        if (peak_jump >= kDeclickThreshold) {
+            size_t ramp_frames =
+                static_cast<size_t>(kRate * kDeclickSeconds);
+
+            if (ramp_frames > frames) {
+                ramp_frames = frames;
+            }
+
+            // Start where the unconditional 3 ms smoothing ended.
+            for (size_t f = micro_frames; f < ramp_frames; ++f) {
+                const float local_t =
+                    ramp_frames > micro_frames + 1
+                        ? static_cast<float>(f - micro_frames) /
+                            static_cast<float>(ramp_frames - micro_frames - 1)
                         : 1.0f;
 
-                // Smooth half-cosine correction envelope from 1 to 0.
                 const float w =
                     0.5f * (1.0f + std::cos(
                         static_cast<float>(
-                            3.14159265358979323846 * t)));
+                            3.14159265358979323846 * local_t)));
 
                 samples[f * kChannels] += delta_left * w;
                 samples[f * kChannels + 1] += delta_right * w;
