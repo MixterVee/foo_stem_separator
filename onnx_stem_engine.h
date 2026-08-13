@@ -1,5 +1,4 @@
 #pragma once
-#include <windows.h>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -36,7 +35,9 @@ private:
     std::wstring vocals_model_path() const;
     std::wstring accompaniment_model_path() const;
 
-    HMODULE m_module = nullptr;
+    // Keep Windows types out of this header so windows.h is not pulled in
+    // before the foobar2000 SDK / Winsock2 headers.
+    void* m_module = nullptr;
     const void* m_separator = nullptr;
     bool m_attempted = false;
     std::wstring m_error;
