@@ -47,7 +47,6 @@ public:
         const unsigned chan_config = chunk->get_channel_config();
 
         if (channels != 2 || rate != 44100) {
-            // Unsupported format: bypass unchanged.
             reset_buffer();
             return true;
         }
@@ -63,15 +62,15 @@ public:
         m_channels = channels;
         m_channel_config = chan_config;
 
-        const size_t count =
-            chunk->get_sample_count() * channels;
-
+        const size_t values = chunk->get_sample_count() * channels;
         const audio_sample* src = chunk->get_data();
 
-        m_buffer.insert(
-            m_buffer.end(),
-            src,
-            src + count);
+        const size_t old_size = m_buffer.size();
+        m_buffer.resize(old_size + values);
+
+        for (size_t i = 0; i < values; ++i) {
+            m_buffer[old_size + i] = static_cast<float>(src[i]);
+        }
 
         const size_t target_frames =
             static_cast<size_t>(rate * kBlockSeconds);
@@ -89,7 +88,6 @@ public:
             emit_block(block, target_frames);
         }
 
-        // We've consumed the original chunk into our own buffer.
         return false;
     }
 
@@ -107,9 +105,11 @@ public:
 
     double get_latency() override {
         if (m_rate == 0 || m_channels == 0) return 0.0;
+
         const double frames =
             static_cast<double>(m_buffer.size()) /
             static_cast<double>(m_channels);
+
         return frames / static_cast<double>(m_rate);
     }
 
@@ -130,7 +130,6 @@ private:
         size_t frames) {
 
         std::vector<float> processed;
-
         const auto mode = stemmode::get();
 
         if (!m_engine.process_interleaved(
@@ -140,16 +139,19 @@ private:
                 m_rate,
                 mode,
                 processed)) {
-
-            // Graceful fallback to original audio if ONNX is unavailable.
             processed = block;
         }
 
-        audio_chunk* out =
-            insert_chunk(processed.size());
+        std::vector<audio_sample> fb_samples(processed.size());
+
+        for (size_t i = 0; i < processed.size(); ++i) {
+            fb_samples[i] = static_cast<audio_sample>(processed[i]);
+        }
+
+        audio_chunk* out = insert_chunk(fb_samples.size());
 
         out->set_data(
-            processed.data(),
+            fb_samples.data(),
             frames,
             m_channels,
             m_rate,
@@ -157,13 +159,14 @@ private:
     }
 
     void drain_tail() {
-        if (m_buffer.empty() || m_rate == 0 || m_channels == 0) {
+        if (m_buffer.empty() ||
+            m_rate == 0 ||
+            m_channels == 0) {
             reset_buffer();
             return;
         }
 
-        const size_t frames =
-            m_buffer.size() / m_channels;
+        const size_t frames = m_buffer.size() / m_channels;
 
         if (frames > 0) {
             emit_block(m_buffer, frames);
@@ -176,6 +179,7 @@ private:
     unsigned m_rate = 0;
     unsigned m_channels = 0;
     unsigned m_channel_config = 0;
+
     onnxstem::engine m_engine;
 };
 
