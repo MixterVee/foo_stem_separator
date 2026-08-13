@@ -38,10 +38,10 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "0.9.0 multi-rate + clean WAV export",
+    "1.0.0 whole-track WAV export",
     "Native ONNX vocals / instrumental separation.\n"
-    "V16: smoother 4-second playback windows with 1.5-second overlap,\n"
-    "thresholded 10 ms de-clicking, plus Save Vocals/Instrumental as WAV."
+    "Live multi-rate ONNX playback plus whole-track WAV export.\n"
+    "Export uses one Spleeter inference for the entire decoded track—no stitched windows."
 );
 
 VALIDATE_COMPONENT_FILENAME("foo_stem_separator.dll");
@@ -391,174 +391,45 @@ bool separate_for_export(
         return false;
     }
 
-    // Export uses the same overlap logic that proved clean in live playback,
-    // but with larger 12-second windows for more model context.
-    const size_t window_frames =
-        static_cast<size_t>(
-            kExportRate * kExportWindowSeconds);
-
-    const size_t overlap_frames =
-        static_cast<size_t>(
-            kExportRate * kExportOverlapSeconds);
-
-    const size_t hop_frames =
-        window_frames - overlap_frames;
-
-    const size_t window_values =
-        window_frames * kExportChannels;
-
-    const size_t hop_values =
-        hop_frames * kExportChannels;
-
-    std::vector<float> working = input;
-
-    std::vector<float> previous_tail;
-    bool have_previous = false;
-
-    output.clear();
-    output.reserve(input.size());
-
+    // V20: process the COMPLETE decoded track in one Spleeter inference.
+    //
+    // This deliberately removes all export window boundaries. The earlier
+    // exporter used overlapping blocks and could still create occasional
+    // discontinuities/clicks in the saved WAV even though live playback was
+    // clean. sherpa-onnx source separation is an offline API, so whole-track
+    // processing is the most natural export path.
     onnxstem::engine engine;
 
-    size_t offset_values = 0;
+    std::vector<float> vocals;
+    std::vector<float> instrumental;
 
-    while (working.size() - offset_values >= window_values) {
-        std::vector<float> window(
-            working.begin() +
-                static_cast<std::ptrdiff_t>(offset_values),
-            working.begin() +
-                static_cast<std::ptrdiff_t>(
-                    offset_values + window_values));
+    if (!engine.process_both(
+            input.data(),
+            total_frames,
+            kExportChannels,
+            kExportRate,
+            vocals,
+            instrumental)) {
 
-        std::vector<float> vocals;
-        std::vector<float> instrumental;
+        error =
+            L"ONNX separation failed: " +
+            engine.last_error();
 
-        if (!engine.process_both(
-                window.data(),
-                window_frames,
-                kExportChannels,
-                kExportRate,
-                vocals,
-                instrumental)) {
-
-            error =
-                L"ONNX separation failed: " +
-                engine.last_error();
-
-            return false;
-        }
-
-        const auto& stem =
-            want_vocals
-                ? vocals
-                : instrumental;
-
-        if (!have_previous) {
-            output.insert(
-                output.end(),
-                stem.begin(),
-                stem.begin() +
-                    static_cast<std::ptrdiff_t>(
-                        hop_values));
-        }
-        else {
-            constexpr double kHalfPi =
-                1.57079632679489661923;
-
-            for (size_t f = 0;
-                 f < overlap_frames;
-                 ++f) {
-
-                const double t =
-                    overlap_frames > 1
-                        ? static_cast<double>(f) /
-                            static_cast<double>(
-                                overlap_frames - 1)
-                        : 1.0;
-
-                const double c =
-                    std::cos(kHalfPi * t);
-
-                const double s =
-                    std::sin(kHalfPi * t);
-
-                const float a =
-                    static_cast<float>(c * c);
-
-                const float b =
-                    static_cast<float>(s * s);
-
-                for (size_t ch = 0;
-                     ch < kExportChannels;
-                     ++ch) {
-
-                    const size_t i =
-                        f * kExportChannels + ch;
-
-                    output.push_back(
-                        previous_tail[i] * a +
-                        stem[i] * b);
-                }
-            }
-
-            const size_t start =
-                overlap_frames * kExportChannels;
-
-            output.insert(
-                output.end(),
-                stem.begin() +
-                    static_cast<std::ptrdiff_t>(start),
-                stem.begin() +
-                    static_cast<std::ptrdiff_t>(
-                        hop_values));
-        }
-
-        previous_tail.assign(
-            stem.begin() +
-                static_cast<std::ptrdiff_t>(
-                    hop_values),
-            stem.end());
-
-        have_previous = true;
-        offset_values += hop_values;
+        return false;
     }
 
-    if (have_previous) {
-        output.insert(
-            output.end(),
-            previous_tail.begin(),
-            previous_tail.end());
+    const std::vector<float>& selected =
+        want_vocals
+            ? vocals
+            : instrumental;
+
+    if (selected.size() != input.size()) {
+        error =
+            L"ONNX returned a stem with an unexpected sample count.";
+        return false;
     }
 
-    // Skip the input overlap already represented by previous_tail and append
-    // only any true source residual shorter than a full analysis window.
-    size_t residual_start =
-        offset_values;
-
-    if (have_previous) {
-        residual_start +=
-            overlap_frames * kExportChannels;
-    }
-
-    if (residual_start < input.size()) {
-        output.insert(
-            output.end(),
-            input.begin() +
-                static_cast<std::ptrdiff_t>(
-                    residual_start),
-            input.end());
-    }
-
-    // Keep file duration/sample count exactly aligned with the source decode.
-    if (output.size() > input.size()) {
-        output.resize(input.size());
-    }
-    else if (output.size() < input.size()) {
-        output.resize(
-            input.size(),
-            0.0f);
-    }
-
+    output = selected;
     return true;
 }
 
