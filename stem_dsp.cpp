@@ -377,12 +377,14 @@ private:
         // Skip that duplicate region and pass through only any true residual
         // audio after it.
         if (!m_input.empty()) {
-            const size_t skip =
-                m_have_previous_tail
-                    ? std::min(
-                        overlap_values,
-                        m_input.size())
-                    : 0;
+            size_t skip = 0;
+
+        if (m_have_previous_tail) {
+            skip =
+                overlap_values < m_input.size()
+                    ? overlap_values
+                    : m_input.size();
+        }
 
             if (m_input.size() > skip) {
                 std::vector<float> residual(
