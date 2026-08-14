@@ -53,6 +53,8 @@ constexpr double kCacheOverlapSeconds = 3.0;
 constexpr double kPrefetchSeconds = 20.0;
 constexpr double kSwitchFadeSeconds = 0.050;
 constexpr double kCacheHandoffFadeSeconds = 0.080;
+constexpr double kDecodeSeekPrerollSeconds = 5.0;
+constexpr double kFirstBlockFadeSeconds = 0.005;
 
 std::wstring utf8_to_wide_cache(const char* s) {
     if (!s || !*s) return {};
@@ -668,24 +670,24 @@ private:
                 nullptr,
                 &reader);
 
-        if (FAILED(hr)) {
-            return false;
-        }
+        if (FAILED(hr)) return false;
+        if (!configure_reader(reader.Get())) return false;
 
-        if (!configure_reader(
-                reader.Get())) {
-            return false;
+        // V31: compressed/VBR seeks are approximate. Seek early, then use
+        // decoded sample timestamps to trim forward to the exact cache start.
+        double seek_seconds =
+            start_seconds - kDecodeSeekPrerollSeconds;
+
+        if (seek_seconds < 0.0) {
+            seek_seconds = 0.0;
         }
 
         PROPVARIANT pos;
         PropVariantInit(&pos);
-
         pos.vt = VT_I8;
-
         pos.hVal.QuadPart =
             static_cast<LONGLONG>(
-                start_seconds *
-                10000000.0);
+                seek_seconds * 10000000.0);
 
         hr =
             reader->SetCurrentPosition(
@@ -694,23 +696,20 @@ private:
 
         PropVariantClear(&pos);
 
-        if (FAILED(hr)) {
-            return false;
-        }
+        if (FAILED(hr)) return false;
 
         const size_t wanted_frames =
             static_cast<size_t>(
-                kCacheSeconds *
-                kCacheRate);
+                kCacheSeconds * kCacheRate);
 
         audio.clear();
         audio.reserve(
-            wanted_frames *
-            kCacheChannels);
+            wanted_frames * kCacheChannels);
+
+        bool reached_target = false;
 
         while (audio.size() <
-               wanted_frames *
-               kCacheChannels) {
+               wanted_frames * kCacheChannels) {
 
             DWORD stream_index = 0;
             DWORD flags = 0;
@@ -727,18 +726,14 @@ private:
                     &timestamp,
                     &sample);
 
-            if (FAILED(hr)) {
-                return false;
-            }
+            if (FAILED(hr)) return false;
 
             if (flags &
                 MF_SOURCE_READERF_ENDOFSTREAM) {
                 break;
             }
 
-            if (!sample) {
-                continue;
-            }
+            if (!sample) continue;
 
             ComPtr<IMFMediaBuffer> buffer;
 
@@ -746,9 +741,7 @@ private:
                 sample->ConvertToContiguousBuffer(
                     &buffer);
 
-            if (FAILED(hr)) {
-                return false;
-            }
+            if (FAILED(hr)) return false;
 
             BYTE* data = nullptr;
             DWORD max_length = 0;
@@ -760,38 +753,136 @@ private:
                     &max_length,
                     &current_length);
 
-            if (FAILED(hr)) {
-                return false;
-            }
+            if (FAILED(hr)) return false;
 
-            const size_t count =
-                current_length /
-                sizeof(float);
+            const size_t sample_values =
+                current_length / sizeof(float);
+
+            const size_t sample_frames =
+                sample_values / kCacheChannels;
 
             const float* floats =
-                reinterpret_cast<
-                    const float*>(data);
+                reinterpret_cast<const float*>(
+                    data);
 
-            const size_t remaining =
-                wanted_frames *
-                    kCacheChannels -
-                audio.size();
+            size_t first_frame = 0;
 
-            const size_t take =
-                count < remaining
-                    ? count
-                    : remaining;
+            if (!reached_target) {
+                const double sample_start =
+                    static_cast<double>(
+                        timestamp) / 10000000.0;
 
-            audio.insert(
-                audio.end(),
-                floats,
-                floats + take);
+                const double sample_end =
+                    sample_start +
+                    static_cast<double>(
+                        sample_frames) /
+                    static_cast<double>(
+                        kCacheRate);
+
+                if (sample_end <= start_seconds) {
+                    buffer->Unlock();
+                    continue;
+                }
+
+                if (sample_start < start_seconds) {
+                    const double skip_d =
+                        (start_seconds -
+                         sample_start) *
+                        static_cast<double>(
+                            kCacheRate);
+
+                    size_t skip =
+                        static_cast<size_t>(
+                            skip_d + 0.5);
+
+                    if (skip > sample_frames) {
+                        skip = sample_frames;
+                    }
+
+                    first_frame = skip;
+                }
+
+                reached_target = true;
+            }
+
+            const size_t available_frames =
+                sample_frames > first_frame
+                    ? sample_frames - first_frame
+                    : 0;
+
+            const size_t current_frames =
+                audio.size() / kCacheChannels;
+
+            const size_t remaining_frames =
+                wanted_frames > current_frames
+                    ? wanted_frames - current_frames
+                    : 0;
+
+            const size_t take_frames =
+                available_frames < remaining_frames
+                    ? available_frames
+                    : remaining_frames;
+
+            const size_t first_value =
+                first_frame * kCacheChannels;
+
+            const size_t take_values =
+                take_frames * kCacheChannels;
+
+            if (take_values != 0) {
+                audio.insert(
+                    audio.end(),
+                    floats + first_value,
+                    floats + first_value +
+                        take_values);
+            }
 
             buffer->Unlock();
         }
 
-        return !audio.empty();
+        return reached_target && !audio.empty();
     }
+
+    static void apply_first_block_fade(
+        std::vector<float>& samples) {
+
+        const size_t frames =
+            samples.size() / kCacheChannels;
+
+        size_t fade_frames =
+            static_cast<size_t>(
+                kFirstBlockFadeSeconds *
+                static_cast<double>(
+                    kCacheRate));
+
+        if (fade_frames > frames) {
+            fade_frames = frames;
+        }
+
+        if (fade_frames == 0) return;
+
+        for (size_t f = 0;
+             f < fade_frames;
+             ++f) {
+
+            const float gain =
+                fade_frames > 1
+                    ? static_cast<float>(f) /
+                        static_cast<float>(
+                            fade_frames - 1)
+                    : 1.0f;
+
+            for (unsigned ch = 0;
+                 ch < kCacheChannels;
+                 ++ch) {
+
+                samples[
+                    f * kCacheChannels +
+                    ch] *= gain;
+            }
+        }
+    }
+
 
     void worker_main() noexcept {
         HRESULT chr = E_FAIL;
@@ -923,7 +1014,20 @@ private:
                                 instrumental.size() ==
                                     input.size()) {
 
-                                const size_t frames =
+                                
+                                // Only the first live cache block gets this
+                                // tiny fade. Exported WAV/MP3 is untouched.
+                                if (job.start_seconds <=
+                                    0.000001) {
+
+                                    apply_first_block_fade(
+                                        vocals);
+
+                                    apply_first_block_fade(
+                                        instrumental);
+                                }
+
+const size_t frames =
                                     input.size() /
                                     kCacheChannels;
 
