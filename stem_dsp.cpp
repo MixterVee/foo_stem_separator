@@ -25,6 +25,7 @@
 #include <exception>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -110,6 +111,27 @@ struct cache_job {
     uint64_t generation = 0;
     std::wstring path;
     double start_seconds = 0.0;
+    bool force_reanchor = false;
+};
+
+struct sequential_decoder_state {
+    ComPtr<IMFSourceReader> reader;
+    std::wstring path;
+
+    bool valid = false;
+    double next_seconds = 0.0;
+
+    // Last 3 seconds of the previous decoded cache block. Reusing this PCM
+    // gives us overlap without ever seeking backward in the compressed file.
+    std::vector<float> overlap_carry;
+
+    void reset() {
+        reader.Reset();
+        path.clear();
+        valid = false;
+        next_seconds = 0.0;
+        overlap_carry.clear();
+    }
 };
 
 class live_cache_manager {
@@ -245,7 +267,7 @@ public:
             stemmode::get() !=
                 stemmode::mode::original) {
 
-            queue_job_locked(0.0);
+            queue_job_locked(0.0, true);
         }
 
         m_cv.notify_one();
@@ -275,7 +297,7 @@ public:
             stemmode::get() !=
                 stemmode::mode::original) {
 
-            queue_job_locked(seconds);
+            queue_job_locked(seconds, true);
         }
 
         m_cv.notify_one();
@@ -577,7 +599,8 @@ public:
 
 private:
     void queue_job_locked(
-        double start_seconds) {
+        double start_seconds,
+        bool force_reanchor = false) {
 
         if (m_path.empty()) {
             return;
@@ -591,7 +614,8 @@ private:
             cache_job{
                 m_generation,
                 m_path,
-                start_seconds});
+                start_seconds,
+                force_reanchor});
 
         m_job_pending = true;
     }
@@ -657,26 +681,53 @@ private:
         return true;
     }
 
-    static bool decode_segment(
-        const std::wstring& path,
-        double start_seconds,
-        std::vector<float>& audio) {
+    static bool open_decoder(
+        sequential_decoder_state& state,
+        const std::wstring& path) {
 
-        ComPtr<IMFSourceReader> reader;
+        state.reset();
 
         HRESULT hr =
             MFCreateSourceReaderFromURL(
                 path.c_str(),
                 nullptr,
-                &reader);
+                &state.reader);
 
-        if (FAILED(hr)) return false;
-        if (!configure_reader(reader.Get())) return false;
+        if (FAILED(hr)) {
+            return false;
+        }
 
-        // V31: compressed/VBR seeks are approximate. Seek early, then use
-        // decoded sample timestamps to trim forward to the exact cache start.
+        if (!configure_reader(
+                state.reader.Get())) {
+            state.reset();
+            return false;
+        }
+
+        state.path = path;
+        state.valid = true;
+        state.next_seconds = 0.0;
+
+        return true;
+    }
+
+    static bool reanchor_decoder(
+        sequential_decoder_state& state,
+        const std::wstring& path,
+        double target_seconds) {
+
+        if (!state.valid ||
+            state.path != path) {
+
+            if (!open_decoder(
+                    state,
+                    path)) {
+                return false;
+            }
+        }
+
         double seek_seconds =
-            start_seconds - kDecodeSeekPrerollSeconds;
+            target_seconds -
+            kDecodeSeekPrerollSeconds;
 
         if (seek_seconds < 0.0) {
             seek_seconds = 0.0;
@@ -684,32 +735,93 @@ private:
 
         PROPVARIANT pos;
         PropVariantInit(&pos);
+
         pos.vt = VT_I8;
         pos.hVal.QuadPart =
             static_cast<LONGLONG>(
-                seek_seconds * 10000000.0);
+                seek_seconds *
+                10000000.0);
 
-        hr =
-            reader->SetCurrentPosition(
-                GUID_NULL,
-                pos);
+        HRESULT hr =
+            state.reader->
+                SetCurrentPosition(
+                    GUID_NULL,
+                    pos);
 
         PropVariantClear(&pos);
 
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) {
+            state.reset();
+            return false;
+        }
+
+        state.next_seconds =
+            target_seconds;
+
+        return true;
+    }
+
+    static bool decode_exact_block(
+        sequential_decoder_state& state,
+        double requested_start_seconds,
+        bool force_reanchor,
+        std::vector<float>& audio) {
+
+        if (!state.valid) {
+            return false;
+        }
 
         const size_t wanted_frames =
             static_cast<size_t>(
-                kCacheSeconds * kCacheRate);
+                kCacheSeconds *
+                kCacheRate);
+
+        const size_t overlap_frames =
+            static_cast<size_t>(
+                kCacheOverlapSeconds *
+                kCacheRate);
+
+        const size_t wanted_values =
+            wanted_frames *
+            kCacheChannels;
+
+        const size_t overlap_values =
+            overlap_frames *
+            kCacheChannels;
 
         audio.clear();
-        audio.reserve(
-            wanted_frames * kCacheChannels);
+        audio.reserve(wanted_values);
 
-        bool reached_target = false;
+        bool reached_start = false;
+
+        if (force_reanchor) {
+            state.overlap_carry.clear();
+
+            if (!reanchor_decoder(
+                    state,
+                    state.path,
+                    requested_start_seconds)) {
+                return false;
+            }
+        }
+        else if (!state.overlap_carry.empty()) {
+            // Continuous playback path: prepend the exact PCM overlap from
+            // the previous block. No compressed seek and no timestamp guess.
+            audio.insert(
+                audio.end(),
+                state.overlap_carry.begin(),
+                state.overlap_carry.end());
+
+            reached_start = true;
+        }
+        else {
+            // First decoder use without explicit reanchor should still be
+            // treated as starting at current reader position.
+            reached_start = true;
+        }
 
         while (audio.size() <
-               wanted_frames * kCacheChannels) {
+               wanted_values) {
 
             DWORD stream_index = 0;
             DWORD flags = 0;
@@ -717,8 +829,8 @@ private:
 
             ComPtr<IMFSample> sample;
 
-            hr =
-                reader->ReadSample(
+            HRESULT hr =
+                state.reader->ReadSample(
                     MF_SOURCE_READER_FIRST_AUDIO_STREAM,
                     0,
                     &stream_index,
@@ -726,14 +838,19 @@ private:
                     &timestamp,
                     &sample);
 
-            if (FAILED(hr)) return false;
+            if (FAILED(hr)) {
+                state.reset();
+                return false;
+            }
 
             if (flags &
                 MF_SOURCE_READERF_ENDOFSTREAM) {
                 break;
             }
 
-            if (!sample) continue;
+            if (!sample) {
+                continue;
+            }
 
             ComPtr<IMFMediaBuffer> buffer;
 
@@ -741,7 +858,10 @@ private:
                 sample->ConvertToContiguousBuffer(
                     &buffer);
 
-            if (FAILED(hr)) return false;
+            if (FAILED(hr)) {
+                state.reset();
+                return false;
+            }
 
             BYTE* data = nullptr;
             DWORD max_length = 0;
@@ -753,24 +873,30 @@ private:
                     &max_length,
                     &current_length);
 
-            if (FAILED(hr)) return false;
+            if (FAILED(hr)) {
+                state.reset();
+                return false;
+            }
 
             const size_t sample_values =
-                current_length / sizeof(float);
+                current_length /
+                sizeof(float);
 
             const size_t sample_frames =
-                sample_values / kCacheChannels;
+                sample_values /
+                kCacheChannels;
 
             const float* floats =
-                reinterpret_cast<const float*>(
-                    data);
+                reinterpret_cast<
+                    const float*>(data);
 
             size_t first_frame = 0;
 
-            if (!reached_target) {
+            if (!reached_start) {
                 const double sample_start =
                     static_cast<double>(
-                        timestamp) / 10000000.0;
+                        timestamp) /
+                    10000000.0;
 
                 const double sample_end =
                     sample_start +
@@ -779,14 +905,18 @@ private:
                     static_cast<double>(
                         kCacheRate);
 
-                if (sample_end <= start_seconds) {
+                if (sample_end <=
+                    requested_start_seconds) {
+
                     buffer->Unlock();
                     continue;
                 }
 
-                if (sample_start < start_seconds) {
+                if (sample_start <
+                    requested_start_seconds) {
+
                     const double skip_d =
-                        (start_seconds -
+                        (requested_start_seconds -
                          sample_start) *
                         static_cast<double>(
                             kCacheRate);
@@ -795,59 +925,103 @@ private:
                         static_cast<size_t>(
                             skip_d + 0.5);
 
-                    if (skip > sample_frames) {
+                    if (skip >
+                        sample_frames) {
                         skip = sample_frames;
                     }
 
                     first_frame = skip;
                 }
 
-                reached_target = true;
+                reached_start = true;
             }
 
             const size_t available_frames =
-                sample_frames > first_frame
-                    ? sample_frames - first_frame
+                sample_frames >
+                    first_frame
+                    ? sample_frames -
+                        first_frame
                     : 0;
 
             const size_t current_frames =
-                audio.size() / kCacheChannels;
+                audio.size() /
+                kCacheChannels;
 
             const size_t remaining_frames =
-                wanted_frames > current_frames
-                    ? wanted_frames - current_frames
+                wanted_frames >
+                    current_frames
+                    ? wanted_frames -
+                        current_frames
                     : 0;
 
             const size_t take_frames =
-                available_frames < remaining_frames
+                available_frames <
+                    remaining_frames
                     ? available_frames
                     : remaining_frames;
 
             const size_t first_value =
-                first_frame * kCacheChannels;
+                first_frame *
+                kCacheChannels;
 
             const size_t take_values =
-                take_frames * kCacheChannels;
+                take_frames *
+                kCacheChannels;
 
             if (take_values != 0) {
                 audio.insert(
                     audio.end(),
                     floats + first_value,
-                    floats + first_value +
+                    floats +
+                        first_value +
                         take_values);
             }
 
             buffer->Unlock();
         }
 
-        return reached_target && !audio.empty();
+        if (!reached_start ||
+            audio.empty()) {
+            return false;
+        }
+
+        // Save the exact tail PCM for the next 3-second overlap. This is the
+        // key V32 behavior: no backward seek is ever needed during continuous
+        // playback, including VBR sources.
+        state.overlap_carry.clear();
+
+        if (audio.size() >
+            overlap_values) {
+
+            state.overlap_carry.assign(
+                audio.end() -
+                    static_cast<std::ptrdiff_t>(
+                        overlap_values),
+                audio.end());
+        }
+        else {
+            state.overlap_carry = audio;
+        }
+
+        state.next_seconds =
+            requested_start_seconds +
+            static_cast<double>(
+                audio.size() /
+                kCacheChannels -
+                overlap_frames) /
+            static_cast<double>(
+                kCacheRate);
+
+        return true;
     }
+
 
     static void apply_first_block_fade(
         std::vector<float>& samples) {
 
         const size_t frames =
-            samples.size() / kCacheChannels;
+            samples.size() /
+            kCacheChannels;
 
         size_t fade_frames =
             static_cast<size_t>(
@@ -859,7 +1033,9 @@ private:
             fade_frames = frames;
         }
 
-        if (fade_frames == 0) return;
+        if (fade_frames == 0) {
+            return;
+        }
 
         for (size_t f = 0;
              f < fade_frames;
@@ -938,6 +1114,8 @@ private:
             // top-level exception boundary prevents std::terminate().
             onnxstem::engine engine;
 
+            sequential_decoder_state decoder_state;
+
             for (;;) {
                 cache_job job;
 
@@ -967,10 +1145,27 @@ private:
                 try {
                     std::vector<float> input;
 
+                    // New track / seek: reanchor once.
+                    // Ordinary continuation: keep reading from the SAME
+                    // Media Foundation decoder timeline.
+                    if (!decoder_state.valid ||
+                        decoder_state.path !=
+                            job.path) {
+
+                        if (!open_decoder(
+                                decoder_state,
+                                job.path)) {
+
+                            throw std::runtime_error(
+                                "Could not open live decoder");
+                        }
+                    }
+
                     const bool decoded =
-                        decode_segment(
-                            job.path,
+                        decode_exact_block(
+                            decoder_state,
                             job.start_seconds,
+                            job.force_reanchor,
                             input);
 
                     std::vector<float> vocals;
