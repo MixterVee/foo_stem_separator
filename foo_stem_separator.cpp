@@ -39,7 +39,7 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "1.8.0 crash-hardened pre-cache + MP3/WAV export",
+    "1.9.0 submenu UI + crash-hardened pre-cache + MP3/WAV export",
     "Native ONNX vocals / instrumental separation.\n"
     "Zero-latency position-cache playback with optional start pre-cache and clean WAV/MP3 export.\n"
     "Live stems use independent read-ahead caching; export uses whole-track Spleeter inference with WAV or 320 kbps MP3 output."
@@ -824,10 +824,24 @@ void begin_export(
     ).detach();
 }
 
+static const GUID g_stem_separator_context_group =
+    {0x72a4f1c1,0x4ad3,0x4bb6,{0x98,0x2d,0x7f,0x42,0x31,0x90,0x45,0x10}};
+
+static contextmenu_group_popup_factory
+    g_stem_separator_context_group_factory(
+        g_stem_separator_context_group,
+        contextmenu_groups::root,
+        "Stem Separator",
+        0);
+
 class stem_mode_context_menu :
     public contextmenu_item_simple {
 
 public:
+    GUID get_parent() override {
+        return g_stem_separator_context_group;
+    }
+
     enum command_id : unsigned {
         cmd_original = 0,
         cmd_vocals,
@@ -850,38 +864,38 @@ public:
 
         switch (index) {
         case cmd_original:
-            out = "Stem Separator / Original";
+            out = "Original";
             break;
 
         case cmd_vocals:
-            out = "Stem Separator / Vocals";
+            out = "Vocals";
             break;
 
         case cmd_instrumental:
-            out = "Stem Separator / Instrumental";
+            out = "Instrumental";
             break;
 
         case cmd_save_vocals:
-            out = "Stem Separator / Save Vocals as WAV...";
+            out = "Save Vocals as WAV...";
             break;
 
         case cmd_save_instrumental:
-            out = "Stem Separator / Save Instrumental as WAV...";
+            out = "Save Instrumental as WAV...";
             break;
 
         case cmd_save_vocals_mp3:
-            out = "Stem Separator / Save Vocals as MP3...";
+            out = "Save Vocals as MP3...";
             break;
 
         case cmd_save_instrumental_mp3:
-            out = "Stem Separator / Save Instrumental as MP3...";
+            out = "Save Instrumental as MP3...";
             break;
 
         case cmd_precache_start:
             out =
                 stem_precache::enabled()
-                    ? "Stem Separator / Pre-cache at track start: ON"
-                    : "Stem Separator / Pre-cache at track start: OFF";
+                    ? "Pre-cache at track start: ON"
+                    : "Pre-cache at track start: OFF";
             break;
 
         default:
