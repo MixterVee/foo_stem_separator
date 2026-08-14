@@ -961,7 +961,7 @@ private:
                     kCacheRate) +
                 0.5);
 
-        const uint64_t block_end_frame =
+        const uint64_t desired_block_end_frame =
             block_start_frame +
             window_frames;
 
@@ -974,12 +974,9 @@ private:
                     requested_start_seconds)) {
                 return false;
             }
-
             reached_target = false;
         }
 
-        // If requested start precedes FIFO start, the only valid recovery is
-        // a reanchor. Normal continuous playback should never hit this path.
         if (block_start_frame <
             state.fifo_start_frame) {
 
@@ -989,22 +986,32 @@ private:
                     requested_start_seconds)) {
                 return false;
             }
-
             reached_target = false;
         }
 
         if (!append_decoded_until(
                 state,
-                block_end_frame,
+                desired_block_end_frame,
                 requested_start_seconds,
                 reached_target)) {
             return false;
         }
 
         if (block_start_frame <
-                state.fifo_start_frame ||
-            block_end_frame >
-                state.decoded_end_frame) {
+            state.fifo_start_frame) {
+            return false;
+        }
+
+        // V34: allow a short final block at EOF instead of requiring a full
+        // 20-second cache window.
+        const uint64_t actual_block_end_frame =
+            state.decoded_end_frame <
+                desired_block_end_frame
+                ? state.decoded_end_frame
+                : desired_block_end_frame;
+
+        if (actual_block_end_frame <=
+            block_start_frame) {
             return false;
         }
 
@@ -1012,18 +1019,22 @@ private:
             block_start_frame -
             state.fifo_start_frame;
 
+        const uint64_t actual_frames =
+            actual_block_end_frame -
+            block_start_frame;
+
         const size_t offset_values =
             static_cast<size_t>(
                 offset_frames *
                 kCacheChannels);
 
-        const size_t block_values =
+        const size_t actual_values =
             static_cast<size_t>(
-                window_frames *
+                actual_frames *
                 kCacheChannels);
 
         if (offset_values +
-                block_values >
+                actual_values >
             state.fifo.size()) {
             return false;
         }
@@ -1035,12 +1046,8 @@ private:
             state.fifo.begin() +
                 static_cast<std::ptrdiff_t>(
                     offset_values +
-                    block_values));
+                    actual_values));
 
-        // Retain only PCM needed for the next overlapped block. Since cache
-        // starts advance by exactly 17 seconds, drop everything before that
-        // absolute frame. This is purely sample-index math; MF buffer
-        // boundaries do not affect cache timing.
         const uint64_t hop_frames =
             static_cast<uint64_t>(
                 (kCacheSeconds -
@@ -1054,7 +1061,9 @@ private:
             hop_frames;
 
         if (next_start_frame >
-            state.fifo_start_frame) {
+                state.fifo_start_frame &&
+            next_start_frame <=
+                state.decoded_end_frame) {
 
             const uint64_t drop_frames =
                 next_start_frame -
@@ -1071,8 +1080,7 @@ private:
                 state.fifo.erase(
                     state.fifo.begin(),
                     state.fifo.begin() +
-                        static_cast<
-                            std::ptrdiff_t>(
+                        static_cast<std::ptrdiff_t>(
                             drop_values));
 
                 state.fifo_start_frame =
@@ -1240,21 +1248,63 @@ private:
                     std::vector<float> instrumental;
 
                     bool separated = false;
+                    size_t decoded_frames = 0;
 
                     if (decoded) {
-                        const size_t frames =
+                        decoded_frames =
                             input.size() /
                             kCacheChannels;
 
-                        if (frames != 0) {
+                        if (decoded_frames != 0) {
+                            const size_t full_window_frames =
+                                static_cast<size_t>(
+                                    kCacheSeconds *
+                                    static_cast<double>(
+                                        kCacheRate) +
+                                    0.5);
+
+                            std::vector<float> analysis_input =
+                                input;
+
+                            if (decoded_frames <
+                                full_window_frames) {
+
+                                analysis_input.resize(
+                                    full_window_frames *
+                                        kCacheChannels,
+                                    0.0f);
+                            }
+
                             separated =
                                 engine.process_both(
-                                    input.data(),
-                                    frames,
+                                    analysis_input.data(),
+                                    analysis_input.size() /
+                                        kCacheChannels,
                                     kCacheChannels,
                                     kCacheRate,
                                     vocals,
                                     instrumental);
+
+                            if (separated) {
+                                const size_t true_values =
+                                    decoded_frames *
+                                    kCacheChannels;
+
+                                if (vocals.size() >=
+                                        true_values &&
+                                    instrumental.size() >=
+                                        true_values) {
+
+                                    vocals.resize(
+                                        true_values);
+
+                                    instrumental.resize(
+                                        true_values);
+                                }
+                                else {
+                                    separated = false;
+                                }
+                            }
                         }
                     }
 
