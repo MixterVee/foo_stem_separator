@@ -38,10 +38,10 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "1.4.0 cache-margin live + whole-track WAV export",
+    "1.5.0 MP3 export + stable cache-margin live",
     "Native ONNX vocals / instrumental separation.\n"
-    "Zero-latency position-cache playback with wider cache overlap plus whole-track WAV export.\n"
-    "Live stems use independent read-ahead caching; export uses whole-track Spleeter inference."
+    "Zero-latency position-cache playback with clean whole-track WAV/MP3 export.\n"
+    "Live stems use independent read-ahead caching; export uses whole-track Spleeter inference with WAV or 320 kbps MP3 output."
 );
 
 VALIDATE_COMPONENT_FILENAME("foo_stem_separator.dll");
@@ -78,11 +78,15 @@ std::wstring local_path_from_handle(metadb_handle_ptr handle) {
 
 std::wstring default_export_path(
     const std::wstring& source,
-    bool vocals) {
+    bool vocals,
+    bool mp3) {
 
     fs::path p(source);
+
     const std::wstring suffix =
-        vocals ? L" - Vocals.wav" : L" - Instrumental.wav";
+        vocals
+            ? (mp3 ? L" - Vocals.mp3" : L" - Vocals.wav")
+            : (mp3 ? L" - Instrumental.mp3" : L" - Instrumental.wav");
 
     return (
         p.parent_path() /
@@ -92,6 +96,7 @@ std::wstring default_export_path(
 
 bool choose_save_path(
     const std::wstring& initial,
+    bool mp3,
     std::wstring& selected) {
 
     std::vector<wchar_t> filename(32768, L'\0');
@@ -108,10 +113,12 @@ bool choose_save_path(
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = nullptr;
     ofn.lpstrFilter =
-        L"WAV audio (*.wav)\0*.wav\0All files (*.*)\0*.*\0\0";
+        mp3
+            ? L"MP3 audio (*.mp3)\0*.mp3\0All files (*.*)\0*.*\0\0"
+            : L"WAV audio (*.wav)\0*.wav\0All files (*.*)\0*.*\0\0";
     ofn.lpstrFile = filename.data();
     ofn.nMaxFile = static_cast<DWORD>(filename.size());
-    ofn.lpstrDefExt = L"wav";
+    ofn.lpstrDefExt = mp3 ? L"mp3" : L"wav";
     ofn.Flags =
         OFN_OVERWRITEPROMPT |
         OFN_PATHMUSTEXIST |
@@ -377,7 +384,7 @@ bool write_float_wav(
     return true;
 }
 
-bool separate_for_export(
+bool write_mp3_320(\n    const std::wstring& path,\n    const std::vector<float>& samples,\n    std::wstring& error) {\n\n    if (samples.empty()) {\n        error = L"No audio samples to encode.";\n        return false;\n    }\n\n    mf_shutdown_guard mf;\n    if (!mf.start(error)) {\n        return false;\n    }\n\n    ComPtr<IMFSinkWriter> writer;\n\n    HRESULT hr =\n        MFCreateSinkWriterFromURL(\n            path.c_str(),\n            nullptr,\n            nullptr,\n            &writer);\n\n    if (FAILED(hr)) {\n        error = L"Could not create the MP3 output file.";\n        return false;\n    }\n\n    ComPtr<IMFMediaType> output_type;\n    hr = MFCreateMediaType(&output_type);\n    if (FAILED(hr)) {\n        error = L"Could not create the MP3 output format.";\n        return false;\n    }\n\n    output_type->SetGUID(\n        MF_MT_MAJOR_TYPE,\n        MFMediaType_Audio);\n\n    output_type->SetGUID(\n        MF_MT_SUBTYPE,\n        MFAudioFormat_MP3);\n\n    output_type->SetUINT32(\n        MF_MT_AUDIO_NUM_CHANNELS,\n        kExportChannels);\n\n    output_type->SetUINT32(\n        MF_MT_AUDIO_SAMPLES_PER_SECOND,\n        kExportRate);\n\n    // Media Foundation specifies encoded MP3 bitrate here in BYTES/sec.\n    output_type->SetUINT32(\n        MF_MT_AUDIO_AVG_BYTES_PER_SECOND,\n        320000 / 8);\n\n    DWORD stream_index = 0;\n\n    hr = writer->AddStream(\n        output_type.Get(),\n        &stream_index);\n\n    if (FAILED(hr)) {\n        error = L"The Windows MP3 encoder did not accept 320 kbps stereo output.";\n        return false;\n    }\n\n    // The built-in Media Foundation MP3 encoder accepts 16-bit integer PCM,\n    // not 32-bit floating point, so convert the clean Spleeter float output\n    // only at this final encoding stage.\n    ComPtr<IMFMediaType> input_type;\n    hr = MFCreateMediaType(&input_type);\n    if (FAILED(hr)) {\n        error = L"Could not create the MP3 encoder input format.";\n        return false;\n    }\n\n    input_type->SetGUID(\n        MF_MT_MAJOR_TYPE,\n        MFMediaType_Audio);\n\n    input_type->SetGUID(\n        MF_MT_SUBTYPE,\n        MFAudioFormat_PCM);\n\n    input_type->SetUINT32(\n        MF_MT_AUDIO_NUM_CHANNELS,\n        kExportChannels);\n\n    input_type->SetUINT32(\n        MF_MT_AUDIO_SAMPLES_PER_SECOND,\n        kExportRate);\n\n    input_type->SetUINT32(\n        MF_MT_AUDIO_BITS_PER_SAMPLE,\n        16);\n\n    input_type->SetUINT32(\n        MF_MT_AUDIO_BLOCK_ALIGNMENT,\n        kExportChannels * sizeof(int16_t));\n\n    input_type->SetUINT32(\n        MF_MT_AUDIO_AVG_BYTES_PER_SECOND,\n        kExportRate * kExportChannels * sizeof(int16_t));\n\n    hr = writer->SetInputMediaType(\n        stream_index,\n        input_type.Get(),\n        nullptr);\n\n    if (FAILED(hr)) {\n        error = L"Could not configure the Windows MP3 encoder for 16-bit PCM input.";\n        return false;\n    }\n\n    hr = writer->BeginWriting();\n    if (FAILED(hr)) {\n        error = L"Could not start MP3 encoding.";\n        return false;\n    }\n\n    const size_t total_frames =\n        samples.size() / kExportChannels;\n\n    const size_t frames_per_block = kExportRate;\n    size_t frame_offset = 0;\n    LONGLONG sample_time = 0;\n\n    while (frame_offset < total_frames) {\n        const size_t remaining =\n            total_frames - frame_offset;\n\n        const size_t frame_count =\n            remaining < frames_per_block\n                ? remaining\n                : frames_per_block;\n\n        std::vector<int16_t> pcm(\n            frame_count * kExportChannels);\n\n        const size_t sample_offset =\n            frame_offset * kExportChannels;\n\n        for (size_t i = 0; i < pcm.size(); ++i) {\n            float v = samples[sample_offset + i];\n\n            if (v > 1.0f) v = 1.0f;\n            if (v < -1.0f) v = -1.0f;\n\n            const float scaled =\n                v >= 0.0f\n                    ? v * 32767.0f\n                    : v * 32768.0f;\n\n            pcm[i] =\n                static_cast<int16_t>(\n                    std::lrint(scaled));\n        }\n\n        const DWORD byte_count =\n            static_cast<DWORD>(\n                pcm.size() * sizeof(int16_t));\n\n        ComPtr<IMFMediaBuffer> buffer;\n        hr = MFCreateMemoryBuffer(\n            byte_count,\n            &buffer);\n\n        if (FAILED(hr)) {\n            error = L"Could not allocate an MP3 encoder buffer.";\n            return false;\n        }\n\n        BYTE* dst = nullptr;\n        DWORD max_length = 0;\n\n        hr = buffer->Lock(\n            &dst,\n            &max_length,\n            nullptr);\n\n        if (FAILED(hr)) {\n            error = L"Could not lock an MP3 encoder buffer.";\n            return false;\n        }\n\n        memcpy(dst, pcm.data(), byte_count);\n        buffer->Unlock();\n        buffer->SetCurrentLength(byte_count);\n\n        ComPtr<IMFSample> sample;\n        hr = MFCreateSample(&sample);\n        if (FAILED(hr)) {\n            error = L"Could not create an MP3 input sample.";\n            return false;\n        }\n\n        sample->AddBuffer(buffer.Get());\n\n        const LONGLONG duration =\n            static_cast<LONGLONG>(\n                (10000000.0 *\n                 static_cast<double>(frame_count)) /\n                static_cast<double>(kExportRate));\n\n        sample->SetSampleTime(sample_time);\n        sample->SetSampleDuration(duration);\n\n        hr = writer->WriteSample(\n            stream_index,\n            sample.Get());\n\n        if (FAILED(hr)) {\n            error = L"Windows Media Foundation failed while encoding MP3 audio.";\n            return false;\n        }\n\n        sample_time += duration;\n        frame_offset += frame_count;\n    }\n\n    hr = writer->Finalize();\n    if (FAILED(hr)) {\n        error = L"Could not finalize the MP3 file.";\n        return false;\n    }\n\n    return true;\n}\n\nbool separate_for_export(
     const std::vector<float>& input,
     bool want_vocals,
     std::vector<float>& output,
@@ -436,7 +443,8 @@ bool separate_for_export(
 void export_thread(
     std::wstring source,
     std::wstring destination,
-    bool vocals) {
+    bool vocals,
+    bool mp3) {
 
     std::vector<float> decoded;
     std::vector<float> separated;
@@ -471,11 +479,18 @@ void export_thread(
         return;
     }
 
-    if (!write_float_wav(
-            destination,
-            separated,
-            error)) {
+    const bool wrote_file =
+        mp3
+            ? write_mp3_320(
+                destination,
+                separated,
+                error)
+            : write_float_wav(
+                destination,
+                separated,
+                error);
 
+    if (!wrote_file) {
         MessageBoxW(
             nullptr,
             error.c_str(),
@@ -485,12 +500,17 @@ void export_thread(
         return;
     }
 
+    const std::wstring format =
+        mp3 ? L"MP3" : L"WAV";
+
     const std::wstring message =
         std::wstring(
             vocals
-                ? L"Vocal WAV saved successfully:\n\n"
-                : L"Instrumental WAV saved successfully:\n\n"
+                ? L"Vocal "
+                : L"Instrumental "
         ) +
+        format +
+        L" saved successfully:\n\n" +
         destination;
 
     MessageBoxW(
@@ -502,7 +522,8 @@ void export_thread(
 
 void begin_export(
     metadb_handle_list_cref data,
-    bool vocals) {
+    bool vocals,
+    bool mp3) {
 
     if (data.get_count() == 0) return;
 
@@ -524,7 +545,11 @@ void begin_export(
     std::wstring destination;
 
     if (!choose_save_path(
-            default_export_path(source, vocals),
+            default_export_path(
+                source,
+                vocals,
+                mp3),
+            mp3,
             destination)) {
         return;
     }
@@ -543,7 +568,8 @@ void begin_export(
         export_thread,
         source,
         destination,
-        vocals
+        vocals,
+        mp3
     ).detach();
 }
 
@@ -557,6 +583,8 @@ public:
         cmd_instrumental,
         cmd_save_vocals,
         cmd_save_instrumental,
+        cmd_save_vocals_mp3,
+        cmd_save_instrumental_mp3,
         cmd_count
     };
 
@@ -589,6 +617,14 @@ public:
             out = "Stem Separator / Save Instrumental as WAV...";
             break;
 
+        case cmd_save_vocals_mp3:
+            out = "Stem Separator / Save Vocals as MP3...";
+            break;
+
+        case cmd_save_instrumental_mp3:
+            out = "Stem Separator / Save Instrumental as MP3...";
+            break;
+
         default:
             out = "Stem Separator";
             break;
@@ -601,7 +637,9 @@ public:
             {0xa92a1002,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x02}},
             {0xa92a1003,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x03}},
             {0xa92a1004,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x04}},
-            {0xa92a1005,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x05}}
+            {0xa92a1005,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x05}},
+            {0xa92a1006,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x06}},
+            {0xa92a1007,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x07}}
         };
 
         return ids[index < cmd_count ? index : 0];
@@ -635,6 +673,18 @@ public:
                 "Separate the complete local track and save "
                 "an instrumental 32-bit float WAV.";
             return true;
+
+        case cmd_save_vocals_mp3:
+            out =
+                "Separate the complete local track and save "
+                "a vocal-only 320 kbps MP3.";
+            return true;
+
+        case cmd_save_instrumental_mp3:
+            out =
+                "Separate the complete local track and save "
+                "an instrumental 320 kbps MP3.";
+            return true;
         }
 
         return false;
@@ -646,12 +696,22 @@ public:
         const GUID&) override {
 
         if (index == cmd_save_vocals) {
-            begin_export(data, true);
+            begin_export(data, true, false);
             return;
         }
 
         if (index == cmd_save_instrumental) {
-            begin_export(data, false);
+            begin_export(data, false, false);
+            return;
+        }
+
+        if (index == cmd_save_vocals_mp3) {
+            begin_export(data, true, true);
+            return;
+        }
+
+        if (index == cmd_save_instrumental_mp3) {
+            begin_export(data, false, true);
             return;
         }
 
