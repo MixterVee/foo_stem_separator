@@ -39,7 +39,7 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "1.6.0 optional start pre-cache + MP3/WAV export",
+    "1.7.0 start pre-cache default ON + MP3/WAV export",
     "Native ONNX vocals / instrumental separation.\n"
     "Zero-latency position-cache playback with optional start pre-cache and clean WAV/MP3 export.\n"
     "Live stems use independent read-ahead caching; export uses whole-track Spleeter inference with WAV or 320 kbps MP3 output."
@@ -49,7 +49,7 @@ VALIDATE_COMPONENT_FILENAME("foo_stem_separator.dll");
 
 namespace stem_precache {
 
-static std::atomic<bool> g_enabled{false};
+static std::atomic<bool> g_enabled{true};
 
 bool enabled() {
     return g_enabled.load(std::memory_order_relaxed);
