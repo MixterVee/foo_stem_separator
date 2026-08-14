@@ -384,7 +384,238 @@ bool write_float_wav(
     return true;
 }
 
-bool write_mp3_320(\n    const std::wstring& path,\n    const std::vector<float>& samples,\n    std::wstring& error) {\n\n    if (samples.empty()) {\n        error = L"No audio samples to encode.";\n        return false;\n    }\n\n    mf_shutdown_guard mf;\n    if (!mf.start(error)) {\n        return false;\n    }\n\n    ComPtr<IMFSinkWriter> writer;\n\n    HRESULT hr =\n        MFCreateSinkWriterFromURL(\n            path.c_str(),\n            nullptr,\n            nullptr,\n            &writer);\n\n    if (FAILED(hr)) {\n        error = L"Could not create the MP3 output file.";\n        return false;\n    }\n\n    ComPtr<IMFMediaType> output_type;\n    hr = MFCreateMediaType(&output_type);\n    if (FAILED(hr)) {\n        error = L"Could not create the MP3 output format.";\n        return false;\n    }\n\n    output_type->SetGUID(\n        MF_MT_MAJOR_TYPE,\n        MFMediaType_Audio);\n\n    output_type->SetGUID(\n        MF_MT_SUBTYPE,\n        MFAudioFormat_MP3);\n\n    output_type->SetUINT32(\n        MF_MT_AUDIO_NUM_CHANNELS,\n        kExportChannels);\n\n    output_type->SetUINT32(\n        MF_MT_AUDIO_SAMPLES_PER_SECOND,\n        kExportRate);\n\n    // Media Foundation specifies encoded MP3 bitrate here in BYTES/sec.\n    output_type->SetUINT32(\n        MF_MT_AUDIO_AVG_BYTES_PER_SECOND,\n        320000 / 8);\n\n    DWORD stream_index = 0;\n\n    hr = writer->AddStream(\n        output_type.Get(),\n        &stream_index);\n\n    if (FAILED(hr)) {\n        error = L"The Windows MP3 encoder did not accept 320 kbps stereo output.";\n        return false;\n    }\n\n    // The built-in Media Foundation MP3 encoder accepts 16-bit integer PCM,\n    // not 32-bit floating point, so convert the clean Spleeter float output\n    // only at this final encoding stage.\n    ComPtr<IMFMediaType> input_type;\n    hr = MFCreateMediaType(&input_type);\n    if (FAILED(hr)) {\n        error = L"Could not create the MP3 encoder input format.";\n        return false;\n    }\n\n    input_type->SetGUID(\n        MF_MT_MAJOR_TYPE,\n        MFMediaType_Audio);\n\n    input_type->SetGUID(\n        MF_MT_SUBTYPE,\n        MFAudioFormat_PCM);\n\n    input_type->SetUINT32(\n        MF_MT_AUDIO_NUM_CHANNELS,\n        kExportChannels);\n\n    input_type->SetUINT32(\n        MF_MT_AUDIO_SAMPLES_PER_SECOND,\n        kExportRate);\n\n    input_type->SetUINT32(\n        MF_MT_AUDIO_BITS_PER_SAMPLE,\n        16);\n\n    input_type->SetUINT32(\n        MF_MT_AUDIO_BLOCK_ALIGNMENT,\n        kExportChannels * sizeof(int16_t));\n\n    input_type->SetUINT32(\n        MF_MT_AUDIO_AVG_BYTES_PER_SECOND,\n        kExportRate * kExportChannels * sizeof(int16_t));\n\n    hr = writer->SetInputMediaType(\n        stream_index,\n        input_type.Get(),\n        nullptr);\n\n    if (FAILED(hr)) {\n        error = L"Could not configure the Windows MP3 encoder for 16-bit PCM input.";\n        return false;\n    }\n\n    hr = writer->BeginWriting();\n    if (FAILED(hr)) {\n        error = L"Could not start MP3 encoding.";\n        return false;\n    }\n\n    const size_t total_frames =\n        samples.size() / kExportChannels;\n\n    const size_t frames_per_block = kExportRate;\n    size_t frame_offset = 0;\n    LONGLONG sample_time = 0;\n\n    while (frame_offset < total_frames) {\n        const size_t remaining =\n            total_frames - frame_offset;\n\n        const size_t frame_count =\n            remaining < frames_per_block\n                ? remaining\n                : frames_per_block;\n\n        std::vector<int16_t> pcm(\n            frame_count * kExportChannels);\n\n        const size_t sample_offset =\n            frame_offset * kExportChannels;\n\n        for (size_t i = 0; i < pcm.size(); ++i) {\n            float v = samples[sample_offset + i];\n\n            if (v > 1.0f) v = 1.0f;\n            if (v < -1.0f) v = -1.0f;\n\n            const float scaled =\n                v >= 0.0f\n                    ? v * 32767.0f\n                    : v * 32768.0f;\n\n            pcm[i] =\n                static_cast<int16_t>(\n                    std::lrint(scaled));\n        }\n\n        const DWORD byte_count =\n            static_cast<DWORD>(\n                pcm.size() * sizeof(int16_t));\n\n        ComPtr<IMFMediaBuffer> buffer;\n        hr = MFCreateMemoryBuffer(\n            byte_count,\n            &buffer);\n\n        if (FAILED(hr)) {\n            error = L"Could not allocate an MP3 encoder buffer.";\n            return false;\n        }\n\n        BYTE* dst = nullptr;\n        DWORD max_length = 0;\n\n        hr = buffer->Lock(\n            &dst,\n            &max_length,\n            nullptr);\n\n        if (FAILED(hr)) {\n            error = L"Could not lock an MP3 encoder buffer.";\n            return false;\n        }\n\n        memcpy(dst, pcm.data(), byte_count);\n        buffer->Unlock();\n        buffer->SetCurrentLength(byte_count);\n\n        ComPtr<IMFSample> sample;\n        hr = MFCreateSample(&sample);\n        if (FAILED(hr)) {\n            error = L"Could not create an MP3 input sample.";\n            return false;\n        }\n\n        sample->AddBuffer(buffer.Get());\n\n        const LONGLONG duration =\n            static_cast<LONGLONG>(\n                (10000000.0 *\n                 static_cast<double>(frame_count)) /\n                static_cast<double>(kExportRate));\n\n        sample->SetSampleTime(sample_time);\n        sample->SetSampleDuration(duration);\n\n        hr = writer->WriteSample(\n            stream_index,\n            sample.Get());\n\n        if (FAILED(hr)) {\n            error = L"Windows Media Foundation failed while encoding MP3 audio.";\n            return false;\n        }\n\n        sample_time += duration;\n        frame_offset += frame_count;\n    }\n\n    hr = writer->Finalize();\n    if (FAILED(hr)) {\n        error = L"Could not finalize the MP3 file.";\n        return false;\n    }\n\n    return true;\n}\n\nbool separate_for_export(
+bool write_mp3_320(
+    const std::wstring& path,
+    const std::vector<float>& samples,
+    std::wstring& error) {
+
+    if (samples.empty()) {
+        error = L"No audio samples to encode.";
+        return false;
+    }
+
+    mf_shutdown_guard mf;
+    if (!mf.start(error)) {
+        return false;
+    }
+
+    ComPtr<IMFSinkWriter> writer;
+
+    HRESULT hr =
+        MFCreateSinkWriterFromURL(
+            path.c_str(),
+            nullptr,
+            nullptr,
+            &writer);
+
+    if (FAILED(hr)) {
+        error = L"Could not create the MP3 output file.";
+        return false;
+    }
+
+    ComPtr<IMFMediaType> output_type;
+    hr = MFCreateMediaType(&output_type);
+    if (FAILED(hr)) {
+        error = L"Could not create the MP3 output format.";
+        return false;
+    }
+
+    output_type->SetGUID(
+        MF_MT_MAJOR_TYPE,
+        MFMediaType_Audio);
+
+    output_type->SetGUID(
+        MF_MT_SUBTYPE,
+        MFAudioFormat_MP3);
+
+    output_type->SetUINT32(
+        MF_MT_AUDIO_NUM_CHANNELS,
+        kExportChannels);
+
+    output_type->SetUINT32(
+        MF_MT_AUDIO_SAMPLES_PER_SECOND,
+        kExportRate);
+
+    // Media Foundation specifies encoded MP3 bitrate here in BYTES/sec.
+    output_type->SetUINT32(
+        MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+        320000 / 8);
+
+    DWORD stream_index = 0;
+
+    hr = writer->AddStream(
+        output_type.Get(),
+        &stream_index);
+
+    if (FAILED(hr)) {
+        error = L"The Windows MP3 encoder did not accept 320 kbps stereo output.";
+        return false;
+    }
+
+    // The built-in Media Foundation MP3 encoder accepts 16-bit integer PCM,
+    // not 32-bit floating point, so convert the clean Spleeter float output
+    // only at this final encoding stage.
+    ComPtr<IMFMediaType> input_type;
+    hr = MFCreateMediaType(&input_type);
+    if (FAILED(hr)) {
+        error = L"Could not create the MP3 encoder input format.";
+        return false;
+    }
+
+    input_type->SetGUID(
+        MF_MT_MAJOR_TYPE,
+        MFMediaType_Audio);
+
+    input_type->SetGUID(
+        MF_MT_SUBTYPE,
+        MFAudioFormat_PCM);
+
+    input_type->SetUINT32(
+        MF_MT_AUDIO_NUM_CHANNELS,
+        kExportChannels);
+
+    input_type->SetUINT32(
+        MF_MT_AUDIO_SAMPLES_PER_SECOND,
+        kExportRate);
+
+    input_type->SetUINT32(
+        MF_MT_AUDIO_BITS_PER_SAMPLE,
+        16);
+
+    input_type->SetUINT32(
+        MF_MT_AUDIO_BLOCK_ALIGNMENT,
+        kExportChannels * sizeof(int16_t));
+
+    input_type->SetUINT32(
+        MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+        kExportRate * kExportChannels * sizeof(int16_t));
+
+    hr = writer->SetInputMediaType(
+        stream_index,
+        input_type.Get(),
+        nullptr);
+
+    if (FAILED(hr)) {
+        error = L"Could not configure the Windows MP3 encoder for 16-bit PCM input.";
+        return false;
+    }
+
+    hr = writer->BeginWriting();
+    if (FAILED(hr)) {
+        error = L"Could not start MP3 encoding.";
+        return false;
+    }
+
+    const size_t total_frames =
+        samples.size() / kExportChannels;
+
+    const size_t frames_per_block = kExportRate;
+    size_t frame_offset = 0;
+    LONGLONG sample_time = 0;
+
+    while (frame_offset < total_frames) {
+        const size_t remaining =
+            total_frames - frame_offset;
+
+        const size_t frame_count =
+            remaining < frames_per_block
+                ? remaining
+                : frames_per_block;
+
+        std::vector<int16_t> pcm(
+            frame_count * kExportChannels);
+
+        const size_t sample_offset =
+            frame_offset * kExportChannels;
+
+        for (size_t i = 0; i < pcm.size(); ++i) {
+            float v = samples[sample_offset + i];
+
+            if (v > 1.0f) v = 1.0f;
+            if (v < -1.0f) v = -1.0f;
+
+            const float scaled =
+                v >= 0.0f
+                    ? v * 32767.0f
+                    : v * 32768.0f;
+
+            pcm[i] =
+                static_cast<int16_t>(
+                    std::lrint(scaled));
+        }
+
+        const DWORD byte_count =
+            static_cast<DWORD>(
+                pcm.size() * sizeof(int16_t));
+
+        ComPtr<IMFMediaBuffer> buffer;
+        hr = MFCreateMemoryBuffer(
+            byte_count,
+            &buffer);
+
+        if (FAILED(hr)) {
+            error = L"Could not allocate an MP3 encoder buffer.";
+            return false;
+        }
+
+        BYTE* dst = nullptr;
+        DWORD max_length = 0;
+
+        hr = buffer->Lock(
+            &dst,
+            &max_length,
+            nullptr);
+
+        if (FAILED(hr)) {
+            error = L"Could not lock an MP3 encoder buffer.";
+            return false;
+        }
+
+        memcpy(dst, pcm.data(), byte_count);
+        buffer->Unlock();
+        buffer->SetCurrentLength(byte_count);
+
+        ComPtr<IMFSample> sample;
+        hr = MFCreateSample(&sample);
+        if (FAILED(hr)) {
+            error = L"Could not create an MP3 input sample.";
+            return false;
+        }
+
+        sample->AddBuffer(buffer.Get());
+
+        const LONGLONG duration =
+            static_cast<LONGLONG>(
+                (10000000.0 *
+                 static_cast<double>(frame_count)) /
+                static_cast<double>(kExportRate));
+
+        sample->SetSampleTime(sample_time);
+        sample->SetSampleDuration(duration);
+
+        hr = writer->WriteSample(
+            stream_index,
+            sample.Get());
+
+        if (FAILED(hr)) {
+            error = L"Windows Media Foundation failed while encoding MP3 audio.";
+            return false;
+        }
+
+        sample_time += duration;
+        frame_offset += frame_count;
+    }
+
+    hr = writer->Finalize();
+    if (FAILED(hr)) {
+        error = L"Could not finalize the MP3 file.";
+        return false;
+    }
+
+    return true;
+}
+
+bool separate_for_export(
     const std::vector<float>& input,
     bool want_vocals,
     std::vector<float>& output,
