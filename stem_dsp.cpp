@@ -52,6 +52,7 @@ constexpr double kCacheSeconds = 20.0;
 constexpr double kCacheOverlapSeconds = 3.0;
 constexpr double kPrefetchSeconds = 20.0;
 constexpr double kSwitchFadeSeconds = 0.050;
+constexpr double kCacheHandoffFadeSeconds = 0.080;
 
 std::wstring utf8_to_wide_cache(const char* s) {
     if (!s || !*s) return {};
@@ -502,38 +503,64 @@ public:
                         t >= overlap_start &&
                         t < overlap_end) {
 
-                        double x =
-                            (t - overlap_start) /
-                            (overlap_end -
-                             overlap_start);
+                        const double midpoint =
+                            0.5 *
+                            (overlap_start +
+                             overlap_end);
 
-                        if (x < 0.0) x = 0.0;
-                        if (x > 1.0) x = 1.0;
+                        const double half_fade =
+                            0.5 *
+                            kCacheHandoffFadeSeconds;
 
-                        constexpr double kHalfPi =
-                            1.57079632679489661923;
+                        const double fade_start =
+                            midpoint - half_fade;
 
-                        const double c =
-                            std::cos(
-                                kHalfPi * x);
+                        const double fade_end =
+                            midpoint + half_fade;
 
-                        const double s =
-                            std::sin(
-                                kHalfPi * x);
-
-                        const float a =
-                            static_cast<float>(
-                                c * c);
-
-                        const float b =
-                            static_cast<float>(
-                                s * s);
-
-                        value =
-                            value * a +
+                        const float second_value =
                             sample_from(
                                 *second,
-                                ch) * b;
+                                ch);
+
+                        if (t >= fade_end) {
+                            value =
+                                second_value;
+                        }
+                        else if (t >
+                                 fade_start) {
+
+                            double x =
+                                (t - fade_start) /
+                                (fade_end -
+                                 fade_start);
+
+                            if (x < 0.0) x = 0.0;
+                            if (x > 1.0) x = 1.0;
+
+                            constexpr double kHalfPi =
+                                1.57079632679489661923;
+
+                            const double c =
+                                std::cos(
+                                    kHalfPi * x);
+
+                            const double s =
+                                std::sin(
+                                    kHalfPi * x);
+
+                            const float a =
+                                static_cast<float>(
+                                    c * c);
+
+                            const float b =
+                                static_cast<float>(
+                                    s * s);
+
+                            value =
+                                value * a +
+                                second_value * b;
+                        }
                     }
                 }
 
