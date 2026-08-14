@@ -39,7 +39,7 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "2.2.0 continuous VBR decoder cache + startup de-click + MP3/WAV export",
+    "2.3.0 absolute-sample FIFO cache + startup de-click + MP3/WAV export",
     "Native ONNX vocals / instrumental separation.\n"
     "Zero-latency position-cache playback with optional start pre-cache and clean WAV/MP3 export.\n"
     "Live stems use independent read-ahead caching; export uses whole-track Spleeter inference with WAV or 320 kbps MP3 output."

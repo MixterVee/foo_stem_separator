@@ -119,20 +119,26 @@ struct sequential_decoder_state {
     std::wstring path;
 
     bool valid = false;
-    double next_seconds = 0.0;
 
-    // Last 3 seconds of the previous decoded cache block. Reusing this PCM
-    // gives us overlap without ever seeking backward in the compressed file.
-    std::vector<float> overlap_carry;
+    // Absolute PCM frame index represented by fifo[0].
+    uint64_t fifo_start_frame = 0;
+
+    // Absolute frame index where the decoder will append next.
+    uint64_t decoded_end_frame = 0;
+
+    // Interleaved stereo float PCM.
+    std::vector<float> fifo;
 
     void reset() {
         reader.Reset();
         path.clear();
         valid = false;
-        next_seconds = 0.0;
-        overlap_carry.clear();
+        fifo_start_frame = 0;
+        decoded_end_frame = 0;
+        fifo.clear();
     }
 };
+
 
 class live_cache_manager {
 public:
@@ -705,7 +711,9 @@ private:
 
         state.path = path;
         state.valid = true;
-        state.next_seconds = 0.0;
+        state.fifo_start_frame = 0;
+        state.decoded_end_frame = 0;
+        state.fifo.clear();
 
         return true;
     }
@@ -755,73 +763,31 @@ private:
             return false;
         }
 
-        state.next_seconds =
-            target_seconds;
+        state.fifo.clear();
+
+        // Start absolute indexing at the requested target. We decode from the
+        // preroll position and discard until the exact target timestamp.
+        state.fifo_start_frame =
+            static_cast<uint64_t>(
+                target_seconds *
+                static_cast<double>(
+                    kCacheRate) +
+                0.5);
+
+        state.decoded_end_frame =
+            state.fifo_start_frame;
 
         return true;
     }
 
-    static bool decode_exact_block(
+    static bool append_decoded_until(
         sequential_decoder_state& state,
-        double requested_start_seconds,
-        bool force_reanchor,
-        std::vector<float>& audio) {
+        uint64_t required_end_frame,
+        double trim_target_seconds,
+        bool& reached_target) {
 
-        if (!state.valid) {
-            return false;
-        }
-
-        const size_t wanted_frames =
-            static_cast<size_t>(
-                kCacheSeconds *
-                kCacheRate);
-
-        const size_t overlap_frames =
-            static_cast<size_t>(
-                kCacheOverlapSeconds *
-                kCacheRate);
-
-        const size_t wanted_values =
-            wanted_frames *
-            kCacheChannels;
-
-        const size_t overlap_values =
-            overlap_frames *
-            kCacheChannels;
-
-        audio.clear();
-        audio.reserve(wanted_values);
-
-        bool reached_start = false;
-
-        if (force_reanchor) {
-            state.overlap_carry.clear();
-
-            if (!reanchor_decoder(
-                    state,
-                    state.path,
-                    requested_start_seconds)) {
-                return false;
-            }
-        }
-        else if (!state.overlap_carry.empty()) {
-            // Continuous playback path: prepend the exact PCM overlap from
-            // the previous block. No compressed seek and no timestamp guess.
-            audio.insert(
-                audio.end(),
-                state.overlap_carry.begin(),
-                state.overlap_carry.end());
-
-            reached_start = true;
-        }
-        else {
-            // First decoder use without explicit reanchor should still be
-            // treated as starting at current reader position.
-            reached_start = true;
-        }
-
-        while (audio.size() <
-               wanted_values) {
+        while (state.decoded_end_frame <
+               required_end_frame) {
 
             DWORD stream_index = 0;
             DWORD flags = 0;
@@ -892,7 +858,7 @@ private:
 
             size_t first_frame = 0;
 
-            if (!reached_start) {
+            if (!reached_target) {
                 const double sample_start =
                     static_cast<double>(
                         timestamp) /
@@ -906,17 +872,17 @@ private:
                         kCacheRate);
 
                 if (sample_end <=
-                    requested_start_seconds) {
+                    trim_target_seconds) {
 
                     buffer->Unlock();
                     continue;
                 }
 
                 if (sample_start <
-                    requested_start_seconds) {
+                    trim_target_seconds) {
 
                     const double skip_d =
-                        (requested_start_seconds -
+                        (trim_target_seconds -
                          sample_start) *
                         static_cast<double>(
                             kCacheRate);
@@ -925,15 +891,14 @@ private:
                         static_cast<size_t>(
                             skip_d + 0.5);
 
-                    if (skip >
-                        sample_frames) {
+                    if (skip > sample_frames) {
                         skip = sample_frames;
                     }
 
                     first_frame = skip;
                 }
 
-                reached_start = true;
+                reached_target = true;
             }
 
             const size_t available_frames =
@@ -943,74 +908,177 @@ private:
                         first_frame
                     : 0;
 
-            const size_t current_frames =
-                audio.size() /
-                kCacheChannels;
+            if (available_frames != 0) {
+                const size_t first_value =
+                    first_frame *
+                    kCacheChannels;
 
-            const size_t remaining_frames =
-                wanted_frames >
-                    current_frames
-                    ? wanted_frames -
-                        current_frames
-                    : 0;
+                const size_t values =
+                    available_frames *
+                    kCacheChannels;
 
-            const size_t take_frames =
-                available_frames <
-                    remaining_frames
-                    ? available_frames
-                    : remaining_frames;
-
-            const size_t first_value =
-                first_frame *
-                kCacheChannels;
-
-            const size_t take_values =
-                take_frames *
-                kCacheChannels;
-
-            if (take_values != 0) {
-                audio.insert(
-                    audio.end(),
+                state.fifo.insert(
+                    state.fifo.end(),
                     floats + first_value,
-                    floats +
-                        first_value +
-                        take_values);
+                    floats + first_value +
+                        values);
+
+                state.decoded_end_frame +=
+                    static_cast<uint64_t>(
+                        available_frames);
             }
 
             buffer->Unlock();
         }
 
-        if (!reached_start ||
-            audio.empty()) {
+        return
+            reached_target &&
+            state.decoded_end_frame >
+                state.fifo_start_frame;
+    }
+
+    static bool decode_exact_block(
+        sequential_decoder_state& state,
+        double requested_start_seconds,
+        bool force_reanchor,
+        std::vector<float>& audio) {
+
+        if (!state.valid) {
             return false;
         }
 
-        // Save the exact tail PCM for the next 3-second overlap. This is the
-        // key V32 behavior: no backward seek is ever needed during continuous
-        // playback, including VBR sources.
-        state.overlap_carry.clear();
+        const uint64_t block_start_frame =
+            static_cast<uint64_t>(
+                requested_start_seconds *
+                static_cast<double>(
+                    kCacheRate) +
+                0.5);
 
-        if (audio.size() >
-            overlap_values) {
+        const uint64_t window_frames =
+            static_cast<uint64_t>(
+                kCacheSeconds *
+                static_cast<double>(
+                    kCacheRate) +
+                0.5);
 
-            state.overlap_carry.assign(
-                audio.end() -
-                    static_cast<std::ptrdiff_t>(
-                        overlap_values),
-                audio.end());
+        const uint64_t block_end_frame =
+            block_start_frame +
+            window_frames;
+
+        bool reached_target = true;
+
+        if (force_reanchor) {
+            if (!reanchor_decoder(
+                    state,
+                    state.path,
+                    requested_start_seconds)) {
+                return false;
+            }
+
+            reached_target = false;
         }
-        else {
-            state.overlap_carry = audio;
+
+        // If requested start precedes FIFO start, the only valid recovery is
+        // a reanchor. Normal continuous playback should never hit this path.
+        if (block_start_frame <
+            state.fifo_start_frame) {
+
+            if (!reanchor_decoder(
+                    state,
+                    state.path,
+                    requested_start_seconds)) {
+                return false;
+            }
+
+            reached_target = false;
         }
 
-        state.next_seconds =
-            requested_start_seconds +
-            static_cast<double>(
-                audio.size() /
-                kCacheChannels -
-                overlap_frames) /
-            static_cast<double>(
-                kCacheRate);
+        if (!append_decoded_until(
+                state,
+                block_end_frame,
+                requested_start_seconds,
+                reached_target)) {
+            return false;
+        }
+
+        if (block_start_frame <
+                state.fifo_start_frame ||
+            block_end_frame >
+                state.decoded_end_frame) {
+            return false;
+        }
+
+        const uint64_t offset_frames =
+            block_start_frame -
+            state.fifo_start_frame;
+
+        const size_t offset_values =
+            static_cast<size_t>(
+                offset_frames *
+                kCacheChannels);
+
+        const size_t block_values =
+            static_cast<size_t>(
+                window_frames *
+                kCacheChannels);
+
+        if (offset_values +
+                block_values >
+            state.fifo.size()) {
+            return false;
+        }
+
+        audio.assign(
+            state.fifo.begin() +
+                static_cast<std::ptrdiff_t>(
+                    offset_values),
+            state.fifo.begin() +
+                static_cast<std::ptrdiff_t>(
+                    offset_values +
+                    block_values));
+
+        // Retain only PCM needed for the next overlapped block. Since cache
+        // starts advance by exactly 17 seconds, drop everything before that
+        // absolute frame. This is purely sample-index math; MF buffer
+        // boundaries do not affect cache timing.
+        const uint64_t hop_frames =
+            static_cast<uint64_t>(
+                (kCacheSeconds -
+                 kCacheOverlapSeconds) *
+                static_cast<double>(
+                    kCacheRate) +
+                0.5);
+
+        const uint64_t next_start_frame =
+            block_start_frame +
+            hop_frames;
+
+        if (next_start_frame >
+            state.fifo_start_frame) {
+
+            const uint64_t drop_frames =
+                next_start_frame -
+                state.fifo_start_frame;
+
+            const size_t drop_values =
+                static_cast<size_t>(
+                    drop_frames *
+                    kCacheChannels);
+
+            if (drop_values <=
+                state.fifo.size()) {
+
+                state.fifo.erase(
+                    state.fifo.begin(),
+                    state.fifo.begin() +
+                        static_cast<
+                            std::ptrdiff_t>(
+                            drop_values));
+
+                state.fifo_start_frame =
+                    next_start_frame;
+            }
+        }
 
         return true;
     }
