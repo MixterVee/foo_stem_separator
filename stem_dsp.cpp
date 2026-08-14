@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -765,161 +766,229 @@ private:
         return !audio.empty();
     }
 
-    void worker_main() {
-        const HRESULT chr =
-            CoInitializeEx(
-                nullptr,
-                COINIT_MULTITHREADED);
+    void worker_main() noexcept {
+        HRESULT chr = E_FAIL;
+        bool com_initialized = false;
+        bool mf_started = false;
 
-        const bool com_ok =
-            SUCCEEDED(chr) ||
-            chr == RPC_E_CHANGED_MODE;
+        auto release_waiters =
+            [this](uint64_t generation) {
 
-        if (!com_ok) {
-            return;
-        }
+                {
+                    std::lock_guard<std::mutex>
+                        lock(m_mutex);
 
-        const HRESULT mhr =
-            MFStartup(
-                MF_VERSION,
-                MFSTARTUP_FULL);
+                    if (generation ==
+                        m_generation) {
 
-        if (FAILED(mhr)) {
-            if (SUCCEEDED(chr)) {
-                CoUninitialize();
-            }
-            return;
-        }
-
-        onnxstem::engine engine;
-
-        for (;;) {
-            cache_job job;
-
-            {
-                std::unique_lock<std::mutex>
-                    lock(m_mutex);
-
-                m_cv.wait(
-                    lock,
-                    [this]() {
-                        return
-                            m_stop ||
+                        m_job_pending =
                             !m_jobs.empty();
-                    });
-
-                if (m_stop) {
-                    break;
+                    }
                 }
 
-                job =
-                    std::move(
-                        m_jobs.front());
+                // A pre-cache DSP callback may be waiting for this job.
+                // Always wake it on success OR failure.
+                m_ready_cv.notify_all();
+            };
 
-                m_jobs.pop_front();
+        try {
+            chr =
+                CoInitializeEx(
+                    nullptr,
+                    COINIT_MULTITHREADED);
+
+            if (SUCCEEDED(chr)) {
+                com_initialized = true;
+            }
+            else if (chr !=
+                     RPC_E_CHANGED_MODE) {
+                return;
             }
 
-            std::vector<float> input;
+            const HRESULT mhr =
+                MFStartup(
+                    MF_VERSION,
+                    MFSTARTUP_FULL);
 
-            const bool decoded =
-                decode_segment(
-                    job.path,
-                    job.start_seconds,
-                    input);
-
-            std::vector<float> vocals;
-            std::vector<float> instrumental;
-
-            bool separated = false;
-
-            if (decoded) {
-                const size_t frames =
-                    input.size() /
-                    kCacheChannels;
-
-                separated =
-                    engine.process_both(
-                        input.data(),
-                        frames,
-                        kCacheChannels,
-                        kCacheRate,
-                        vocals,
-                        instrumental);
+            if (FAILED(mhr)) {
+                return;
             }
 
+            mf_started = true;
+
+            // Engine construction itself can throw. Keeping it inside this
+            // top-level exception boundary prevents std::terminate().
+            onnxstem::engine engine;
+
+            for (;;) {
+                cache_job job;
+
+                {
+                    std::unique_lock<std::mutex>
+                        lock(m_mutex);
+
+                    m_cv.wait(
+                        lock,
+                        [this]() {
+                            return
+                                m_stop ||
+                                !m_jobs.empty();
+                        });
+
+                    if (m_stop) {
+                        break;
+                    }
+
+                    job =
+                        std::move(
+                            m_jobs.front());
+
+                    m_jobs.pop_front();
+                }
+
+                try {
+                    std::vector<float> input;
+
+                    const bool decoded =
+                        decode_segment(
+                            job.path,
+                            job.start_seconds,
+                            input);
+
+                    std::vector<float> vocals;
+                    std::vector<float> instrumental;
+
+                    bool separated = false;
+
+                    if (decoded) {
+                        const size_t frames =
+                            input.size() /
+                            kCacheChannels;
+
+                        if (frames != 0) {
+                            separated =
+                                engine.process_both(
+                                    input.data(),
+                                    frames,
+                                    kCacheChannels,
+                                    kCacheRate,
+                                    vocals,
+                                    instrumental);
+                        }
+                    }
+
+                    {
+                        std::lock_guard<std::mutex>
+                            lock(m_mutex);
+
+                        // Seek/new-track happened while this job ran.
+                        if (job.generation !=
+                            m_generation) {
+
+                            m_job_pending =
+                                !m_jobs.empty();
+                        }
+                        else {
+                            if (decoded &&
+                                separated &&
+                                vocals.size() ==
+                                    input.size() &&
+                                instrumental.size() ==
+                                    input.size()) {
+
+                                const size_t frames =
+                                    input.size() /
+                                    kCacheChannels;
+
+                                const double duration =
+                                    static_cast<double>(
+                                        frames) /
+                                    static_cast<double>(
+                                        kCacheRate);
+
+                                cache_segment seg;
+                                seg.generation =
+                                    job.generation;
+                                seg.start_seconds =
+                                    job.start_seconds;
+                                seg.end_seconds =
+                                    job.start_seconds +
+                                    duration;
+
+                                seg.vocals =
+                                    std::move(vocals);
+
+                                seg.instrumental =
+                                    std::move(
+                                        instrumental);
+
+                                while (
+                                    !m_segments.empty() &&
+                                    m_segments.front().
+                                        end_seconds <
+                                    m_anchor_seconds -
+                                        5.0) {
+
+                                    m_segments.pop_front();
+                                }
+
+                                m_segments.push_back(
+                                    std::move(seg));
+                            }
+
+                            m_job_pending =
+                                !m_jobs.empty();
+                        }
+                    }
+
+                    m_ready_cv.notify_all();
+                }
+                catch (const std::exception&) {
+                    // A failed cache job must never take foobar down.
+                    // Drop this job, release any pre-cache waiter, and allow
+                    // playback to fall back to original audio.
+                    release_waiters(
+                        job.generation);
+                }
+                catch (...) {
+                    // sherpa-onnx / Media Foundation can surface non-standard
+                    // exceptions as well. Treat them exactly like a failed
+                    // cache job.
+                    release_waiters(
+                        job.generation);
+                }
+            }
+        }
+        catch (const std::exception&) {
+            // Protect the entire worker lifetime, including ONNX engine
+            // construction. No exception may cross std::thread's entry point.
             {
                 std::lock_guard<std::mutex>
                     lock(m_mutex);
 
-                // A seek/new-track happened while this job was running.
-                if (job.generation !=
-                    m_generation) {
-
-                    m_job_pending =
-                        !m_jobs.empty();
-
-                    continue;
-                }
-
-                if (decoded &&
-                    separated &&
-                    vocals.size() ==
-                        input.size() &&
-                    instrumental.size() ==
-                        input.size()) {
-
-                    const size_t frames =
-                        input.size() /
-                        kCacheChannels;
-
-                    const double duration =
-                        static_cast<double>(
-                            frames) /
-                        static_cast<double>(
-                            kCacheRate);
-
-                    cache_segment seg;
-                    seg.generation =
-                        job.generation;
-                    seg.start_seconds =
-                        job.start_seconds;
-                    seg.end_seconds =
-                        job.start_seconds +
-                        duration;
-
-                    seg.vocals =
-                        std::move(vocals);
-
-                    seg.instrumental =
-                        std::move(
-                            instrumental);
-
-                    // Keep only segments around the active timeline.
-                    while (!m_segments.empty() &&
-                           m_segments.front().
-                               end_seconds <
-                               m_anchor_seconds -
-                                   5.0) {
-
-                        m_segments.pop_front();
-                    }
-
-                    m_segments.push_back(
-                        std::move(seg));
-                }
-
-                m_job_pending =
-                    !m_jobs.empty();
+                m_jobs.clear();
+                m_job_pending = false;
             }
 
-            // Wake a DSP callback that is intentionally waiting for the
-            // first track-start cache block.
+            m_ready_cv.notify_all();
+        }
+        catch (...) {
+            {
+                std::lock_guard<std::mutex>
+                    lock(m_mutex);
+
+                m_jobs.clear();
+                m_job_pending = false;
+            }
+
             m_ready_cv.notify_all();
         }
 
-        MFShutdown();
+        if (mf_started) {
+            MFShutdown();
+        }
 
-        if (SUCCEEDED(chr)) {
+        if (com_initialized) {
             CoUninitialize();
         }
     }
@@ -1114,12 +1183,21 @@ public:
 
             cache_manager().ensure_ahead(0.0);
 
-            const bool ready =
-                cache_manager().
-                    wait_until_ready(
-                        m_generation,
-                        0.0,
-                        15000);
+            bool ready = false;
+
+            try {
+                ready =
+                    cache_manager().
+                        wait_until_ready(
+                            m_generation,
+                            0.0,
+                            15000);
+            }
+            catch (...) {
+                // Never let a pre-cache coordination failure propagate into
+                // foobar's DSP callback.
+                ready = false;
+            }
 
             // If ready, suppress the usual 50 ms original-to-stem fade:
             // the first audible sample should already be the selected stem.
