@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -28,6 +29,10 @@
 
 #include "onnx_stem_engine.h"
 #include "stem_mode.h"
+
+namespace stem_precache {
+bool enabled();
+}
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
@@ -120,6 +125,7 @@ public:
         }
 
         m_cv.notify_all();
+        m_ready_cv.notify_all();
 
         if (m_thread.joinable()) {
             m_thread.join();
@@ -140,6 +146,79 @@ public:
         return m_anchor_seconds;
     }
 
+    bool is_track_start_generation(
+        uint64_t generation) const {
+
+        std::lock_guard<std::mutex> lock(
+            m_mutex);
+
+        return
+            generation != 0 &&
+            generation ==
+                m_track_start_generation;
+    }
+
+    bool wait_until_ready(
+        uint64_t generation,
+        double position_seconds,
+        unsigned timeout_ms) {
+
+        std::unique_lock<std::mutex> lock(
+            m_mutex);
+
+        const auto ready =
+            [this,
+             generation,
+             position_seconds]() {
+
+                if (m_stop ||
+                    generation !=
+                        m_generation) {
+                    return true;
+                }
+
+                for (const auto& seg :
+                     m_segments) {
+
+                    if (position_seconds >=
+                            seg.start_seconds &&
+                        position_seconds <
+                            seg.end_seconds) {
+                        return true;
+                    }
+                }
+
+                return false;
+            };
+
+        if (!m_ready_cv.wait_for(
+                lock,
+                std::chrono::milliseconds(
+                    timeout_ms),
+                ready)) {
+            return false;
+        }
+
+        if (m_stop ||
+            generation !=
+                m_generation) {
+            return false;
+        }
+
+        for (const auto& seg :
+             m_segments) {
+
+            if (position_seconds >=
+                    seg.start_seconds &&
+                position_seconds <
+                    seg.end_seconds) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     void new_track(
         const std::wstring& path) {
 
@@ -147,6 +226,9 @@ public:
             m_mutex);
 
         ++m_generation;
+
+        m_track_start_generation =
+            m_generation;
 
         m_path = path;
         m_anchor_seconds = 0.0;
@@ -174,6 +256,11 @@ public:
             m_mutex);
 
         ++m_generation;
+
+        // A seek keeps V24's immediate-playback behavior.
+        // Start pre-cache applies only to a newly started track.
+        m_track_start_generation = 0;
+
         m_anchor_seconds = seconds;
 
         m_segments.clear();
@@ -195,6 +282,7 @@ public:
             m_mutex);
 
         ++m_generation;
+        m_track_start_generation = 0;
 
         m_path.clear();
         m_anchor_seconds = 0.0;
@@ -823,6 +911,10 @@ private:
                 m_job_pending =
                     !m_jobs.empty();
             }
+
+            // Wake a DSP callback that is intentionally waiting for the
+            // first track-start cache block.
+            m_ready_cv.notify_all();
         }
 
         MFShutdown();
@@ -834,11 +926,13 @@ private:
 
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
+    std::condition_variable m_ready_cv;
 
     std::thread m_thread;
     bool m_stop = false;
 
     uint64_t m_generation = 1;
+    uint64_t m_track_start_generation = 0;
 
     std::wstring m_path;
     double m_anchor_seconds = 0.0;
@@ -1000,13 +1094,46 @@ public:
 
             m_have_position = true;
             m_using_stem = false;
+            m_precache_handled = false;
         }
 
         const stemmode::mode mode =
             stemmode::get();
 
+        // V26: optional track-start pre-cache.
+        //
+        // Only a brand-new track at 0:00 waits. Seeking deliberately does
+        // not enter this path, preserving V24's immediate seek response.
+        if (!m_precache_handled &&
+            mode !=
+                stemmode::mode::original &&
+            stem_precache::enabled() &&
+            cache_manager().
+                is_track_start_generation(
+                    m_generation)) {
+
+            cache_manager().ensure_ahead(0.0);
+
+            const bool ready =
+                cache_manager().
+                    wait_until_ready(
+                        m_generation,
+                        0.0,
+                        15000);
+
+            // If ready, suppress the usual 50 ms original-to-stem fade:
+            // the first audible sample should already be the selected stem.
+            if (ready) {
+                m_using_stem = true;
+            }
+
+            m_precache_handled = true;
+        }
+
         if (mode ==
             stemmode::mode::original) {
+
+            m_precache_handled = true;
 
             m_position_seconds +=
                 static_cast<double>(
@@ -1144,6 +1271,7 @@ public:
         // We only reset this DSP instance's local timeline.
         m_have_position = false;
         m_using_stem = false;
+        m_precache_handled = false;
     }
 
     double get_latency() override {
@@ -1159,12 +1287,14 @@ private:
     void reset_local() {
         m_have_position = false;
         m_using_stem = false;
+        m_precache_handled = false;
         m_position_seconds = 0.0;
         m_generation = 0;
     }
 
     bool m_have_position = false;
     bool m_using_stem = false;
+    bool m_precache_handled = false;
 
     uint64_t m_generation = 0;
     double m_position_seconds = 0.0;

@@ -16,6 +16,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -38,13 +39,32 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "1.5.0 MP3 export + stable cache-margin live",
+    "1.6.0 optional start pre-cache + MP3/WAV export",
     "Native ONNX vocals / instrumental separation.\n"
-    "Zero-latency position-cache playback with clean whole-track WAV/MP3 export.\n"
+    "Zero-latency position-cache playback with optional start pre-cache and clean WAV/MP3 export.\n"
     "Live stems use independent read-ahead caching; export uses whole-track Spleeter inference with WAV or 320 kbps MP3 output."
 );
 
 VALIDATE_COMPONENT_FILENAME("foo_stem_separator.dll");
+
+namespace stem_precache {
+
+static std::atomic<bool> g_enabled{false};
+
+bool enabled() {
+    return g_enabled.load(std::memory_order_relaxed);
+}
+
+void toggle() {
+    const bool current =
+        g_enabled.load(std::memory_order_relaxed);
+
+    g_enabled.store(
+        !current,
+        std::memory_order_relaxed);
+}
+
+} // namespace stem_precache
 
 namespace {
 
@@ -816,6 +836,7 @@ public:
         cmd_save_instrumental,
         cmd_save_vocals_mp3,
         cmd_save_instrumental_mp3,
+        cmd_precache_start,
         cmd_count
     };
 
@@ -856,6 +877,13 @@ public:
             out = "Stem Separator / Save Instrumental as MP3...";
             break;
 
+        case cmd_precache_start:
+            out =
+                stem_precache::enabled()
+                    ? "Stem Separator / Pre-cache at track start: ON"
+                    : "Stem Separator / Pre-cache at track start: OFF";
+            break;
+
         default:
             out = "Stem Separator";
             break;
@@ -870,7 +898,8 @@ public:
             {0xa92a1004,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x04}},
             {0xa92a1005,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x05}},
             {0xa92a1006,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x06}},
-            {0xa92a1007,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x07}}
+            {0xa92a1007,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x07}},
+            {0xa92a1008,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x08}}
         };
 
         return ids[index < cmd_count ? index : 0];
@@ -916,6 +945,13 @@ public:
                 "Separate the complete local track and save "
                 "an instrumental 320 kbps MP3.";
             return true;
+
+        case cmd_precache_start:
+            out =
+                "When enabled, wait for the first stem cache block "
+                "before a new track begins audibly, so Vocal or "
+                "Instrumental is present from the first sample.";
+            return true;
         }
 
         return false;
@@ -925,6 +961,17 @@ public:
         unsigned index,
         metadb_handle_list_cref data,
         const GUID&) override {
+
+        if (index == cmd_precache_start) {
+            stem_precache::toggle();
+
+            console::print(
+                stem_precache::enabled()
+                    ? "Stem Separator: pre-cache at track start ON"
+                    : "Stem Separator: pre-cache at track start OFF");
+
+            return;
+        }
 
         if (index == cmd_save_vocals) {
             begin_export(data, true, false);
