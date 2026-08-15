@@ -32,12 +32,14 @@ $cppFiles = @(
     "foo_stem_separator.cpp",
     "stem_mode.cpp",
     "onnx_stem_engine.cpp",
-    "stem_dsp.cpp"
+    "stem_dsp.cpp",
+    "stem_waveform_provider.cpp"
 )
 
 $hFiles = @(
     "stem_mode.h",
-    "onnx_stem_engine.h"
+    "onnx_stem_engine.h",
+    "stem_waveform_provider.h"
 )
 
 foreach ($name in ($cppFiles + $hFiles)) {
