@@ -31,6 +31,7 @@
 
 #include "onnx_stem_engine.h"
 #include "stem_mode.h"
+#include "stem_transport_service.h"
 
 namespace stem_precache {
 bool enabled();
@@ -43,6 +44,11 @@ bool enabled();
 #pragma comment(lib, "propsys.lib")
 
 using Microsoft::WRL::ComPtr;
+
+#undef FOOGUIDDECL
+#define FOOGUIDDECL
+FOOGUIDDECL const GUID stem_transport_service::class_guid =
+{ 0x3f42b0c7, 0x8df1, 0x4fb9, { 0xa6, 0x7d, 0x21, 0x55, 0x91, 0xc8, 0x43, 0x6e } };
 
 namespace {
 
@@ -103,6 +109,9 @@ struct cache_segment {
     double start_seconds = 0.0;
     double end_seconds = 0.0;
 
+    // Keep the decoded original beside both stems. Normal playback still uses
+    // foobar's incoming chunk; this copy is only for jog/reverse preview.
+    std::vector<float> original;
     std::vector<float> vocals;
     std::vector<float> instrumental;
 };
@@ -112,6 +121,8 @@ struct cache_job {
     std::wstring path;
     double start_seconds = 0.0;
     bool force_reanchor = false;
+    bool transport_preview = false;
+    bool need_stems = true;
 };
 
 struct sequential_decoder_state {
@@ -295,7 +306,9 @@ public:
 
         m_anchor_seconds = seconds;
 
-        m_segments.clear();
+        // Keep completed segments from this track. They are position-indexed
+        // and remain valid after a seek; retaining them is what lets a transport
+        // release resume directly in Vocals/Instrumental without leaking Original.
         m_jobs.clear();
         m_job_pending = false;
 
@@ -371,17 +384,56 @@ public:
         }
     }
 
+    void request_transport(double position_seconds, bool reverse) {
+        if (position_seconds < 0.0) position_seconds = 0.0;
+        const stemmode::mode mode = stemmode::get();
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_path.empty()) return;
+
+        // Require a little playable material on the side in which transport will
+        // travel. If it is already cached, no worker job is necessary.
+        const double margin = 0.35;
+        const double need_start = reverse
+            ? std::max(0.0, position_seconds - margin)
+            : position_seconds;
+        const double need_end = reverse
+            ? position_seconds
+            : position_seconds + margin;
+
+        for (const auto& seg : m_segments) {
+            if (!segment_has_mode(seg, mode)) continue;
+            if (seg.start_seconds <= need_start + 1.0e-6 &&
+                seg.end_seconds >= need_end - 1.0e-6) {
+                return;
+            }
+        }
+
+        // Coalesce scrub requests: a slow Spleeter job must never build a queue of
+        // obsolete mouse positions. The newest transport target goes to the front.
+        for (auto it = m_jobs.begin(); it != m_jobs.end();) {
+            if (it->transport_preview) it = m_jobs.erase(it);
+            else ++it;
+        }
+
+        double start = reverse
+            ? std::max(0.0, position_seconds - (kCacheSeconds - 0.5))
+            : std::max(0.0, position_seconds - 0.5);
+
+        m_jobs.emplace_front(cache_job{
+            m_generation, m_path, start, true, true,
+            mode != stemmode::mode::original});
+        m_job_pending = true;
+        m_cv.notify_one();
+    }
+
     bool render(
         stemmode::mode mode,
         double start_seconds,
         unsigned output_rate,
         size_t frames,
-        std::vector<float>& out) {
-
-        if (mode ==
-            stemmode::mode::original) {
-            return false;
-        }
+        std::vector<float>& out,
+        bool reverse = false) {
 
         if (output_rate == 0 ||
             frames == 0) {
@@ -416,9 +468,12 @@ public:
              f < frames;
              ++f) {
 
+            const double direction = reverse ? -1.0 : 1.0;
             const double t =
                 start_seconds +
-                static_cast<double>(f) * dt;
+                direction * static_cast<double>(f) * dt;
+
+            if (t < 0.0) return false;
 
             const cache_segment* first =
                 nullptr;
@@ -428,6 +483,8 @@ public:
 
             for (const auto& seg :
                  snapshot) {
+
+                if (!segment_has_mode(seg, mode)) continue;
 
                 if (t >= seg.start_seconds &&
                     t < seg.end_seconds) {
@@ -452,10 +509,11 @@ public:
                     unsigned ch) -> float {
 
                 const std::vector<float>& data =
-                    mode ==
-                        stemmode::mode::vocals
-                        ? seg.vocals
-                        : seg.instrumental;
+                    mode == stemmode::mode::original
+                        ? seg.original
+                        : (mode == stemmode::mode::vocals
+                            ? seg.vocals
+                            : seg.instrumental);
 
                 const double rel =
                     t - seg.start_seconds;
@@ -604,6 +662,12 @@ public:
     }
 
 private:
+    static bool segment_has_mode(const cache_segment& seg, stemmode::mode mode) {
+        if (mode == stemmode::mode::original) return !seg.original.empty();
+        if (mode == stemmode::mode::vocals) return !seg.vocals.empty();
+        return !seg.instrumental.empty();
+    }
+
     void queue_job_locked(
         double start_seconds,
         bool force_reanchor = false) {
@@ -621,7 +685,9 @@ private:
                 m_generation,
                 m_path,
                 start_seconds,
-                force_reanchor});
+                force_reanchor,
+                false,
+                true});
 
         m_job_pending = true;
     }
@@ -1191,6 +1257,7 @@ private:
             onnxstem::engine engine;
 
             sequential_decoder_state decoder_state;
+            sequential_decoder_state preview_decoder_state;
 
             for (;;) {
                 cache_job job;
@@ -1221,15 +1288,17 @@ private:
                 try {
                     std::vector<float> input;
 
-                    // New track / seek: reanchor once.
-                    // Ordinary continuation: keep reading from the SAME
-                    // Media Foundation decoder timeline.
-                    if (!decoder_state.valid ||
-                        decoder_state.path !=
-                            job.path) {
+                    // Transport preview gets a separate decoder timeline. A random
+                    // jog request therefore cannot make the ordinary forward cache
+                    // decode a huge gap before its next continuation block.
+                    sequential_decoder_state& active_decoder =
+                        job.transport_preview ? preview_decoder_state : decoder_state;
+
+                    if (!active_decoder.valid ||
+                        active_decoder.path != job.path) {
 
                         if (!open_decoder(
-                                decoder_state,
+                                active_decoder,
                                 job.path)) {
 
                             throw std::runtime_error(
@@ -1239,7 +1308,7 @@ private:
 
                     const bool decoded =
                         decode_exact_block(
-                            decoder_state,
+                            active_decoder,
                             job.start_seconds,
                             job.force_reanchor,
                             input);
@@ -1247,7 +1316,7 @@ private:
                     std::vector<float> vocals;
                     std::vector<float> instrumental;
 
-                    bool separated = false;
+                    bool separated = !job.need_stems;
                     size_t decoded_frames = 0;
 
                     if (decoded) {
@@ -1255,7 +1324,7 @@ private:
                             input.size() /
                             kCacheChannels;
 
-                        if (decoded_frames != 0) {
+                        if (decoded_frames != 0 && job.need_stems) {
                             const size_t full_window_frames =
                                 static_cast<size_t>(
                                     kCacheSeconds *
@@ -1263,23 +1332,17 @@ private:
                                         kCacheRate) +
                                     0.5);
 
-                            std::vector<float> analysis_input =
-                                input;
+                            std::vector<float> analysis_input = input;
 
-                            if (decoded_frames <
-                                full_window_frames) {
-
+                            if (decoded_frames < full_window_frames) {
                                 analysis_input.resize(
-                                    full_window_frames *
-                                        kCacheChannels,
-                                    0.0f);
+                                    full_window_frames * kCacheChannels, 0.0f);
                             }
 
                             separated =
                                 engine.process_both(
                                     analysis_input.data(),
-                                    analysis_input.size() /
-                                        kCacheChannels,
+                                    analysis_input.size() / kCacheChannels,
                                     kCacheChannels,
                                     kCacheRate,
                                     vocals,
@@ -1287,21 +1350,13 @@ private:
 
                             if (separated) {
                                 const size_t true_values =
-                                    decoded_frames *
-                                    kCacheChannels;
+                                    decoded_frames * kCacheChannels;
 
-                                if (vocals.size() >=
-                                        true_values &&
-                                    instrumental.size() >=
-                                        true_values) {
-
-                                    vocals.resize(
-                                        true_values);
-
-                                    instrumental.resize(
-                                        true_values);
-                                }
-                                else {
+                                if (vocals.size() >= true_values &&
+                                    instrumental.size() >= true_values) {
+                                    vocals.resize(true_values);
+                                    instrumental.resize(true_values);
+                                } else {
                                     separated = false;
                                 }
                             }
@@ -1320,64 +1375,39 @@ private:
                                 !m_jobs.empty();
                         }
                         else {
-                            if (decoded &&
-                                separated &&
-                                vocals.size() ==
-                                    input.size() &&
-                                instrumental.size() ==
-                                    input.size()) {
+                            const bool stem_payload_ok =
+                                !job.need_stems ||
+                                (separated &&
+                                 vocals.size() == input.size() &&
+                                 instrumental.size() == input.size());
 
-                                
-                                // Only the first live cache block gets this
-                                // tiny fade. Exported WAV/MP3 is untouched.
-                                if (job.start_seconds <=
-                                    0.000001) {
-
-                                    apply_first_block_fade(
-                                        vocals);
-
-                                    apply_first_block_fade(
-                                        instrumental);
+                            if (decoded && !input.empty() && stem_payload_ok) {
+                                // Only the first separated live cache block gets this
+                                // tiny fade. Original preview data is never altered.
+                                if (job.need_stems && job.start_seconds <= 0.000001) {
+                                    apply_first_block_fade(vocals);
+                                    apply_first_block_fade(instrumental);
                                 }
 
-const size_t frames =
-                                    input.size() /
-                                    kCacheChannels;
-
+                                const size_t frames = input.size() / kCacheChannels;
                                 const double duration =
-                                    static_cast<double>(
-                                        frames) /
-                                    static_cast<double>(
-                                        kCacheRate);
+                                    static_cast<double>(frames) /
+                                    static_cast<double>(kCacheRate);
 
                                 cache_segment seg;
-                                seg.generation =
-                                    job.generation;
-                                seg.start_seconds =
-                                    job.start_seconds;
-                                seg.end_seconds =
-                                    job.start_seconds +
-                                    duration;
-
-                                seg.vocals =
-                                    std::move(vocals);
-
-                                seg.instrumental =
-                                    std::move(
-                                        instrumental);
-
-                                while (
-                                    !m_segments.empty() &&
-                                    m_segments.front().
-                                        end_seconds <
-                                    m_anchor_seconds -
-                                        5.0) {
-
-                                    m_segments.pop_front();
+                                seg.generation = job.generation;
+                                seg.start_seconds = job.start_seconds;
+                                seg.end_seconds = job.start_seconds + duration;
+                                seg.original = input;
+                                if (job.need_stems) {
+                                    seg.vocals = std::move(vocals);
+                                    seg.instrumental = std::move(instrumental);
                                 }
 
-                                m_segments.push_back(
-                                    std::move(seg));
+                                // Completed segments remain valid for the whole track.
+                                // This also makes short reverse moves instant instead of
+                                // re-running Spleeter after every release/seek.
+                                m_segments.push_back(std::move(seg));
                             }
 
                             m_job_pending =
@@ -1461,6 +1491,138 @@ live_cache_manager& cache_manager() {
     return instance;
 }
 
+struct transport_snapshot {
+    int state = stem_transport_normal;
+    double position_seconds = 0.0;
+    double render_seconds = 0.0;
+    ULONGLONG scrub_audible_until = 0;
+};
+
+class transport_controller {
+public:
+    void set_hold(double seconds) {
+        seconds = std::max(0.0, seconds);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_state = stem_transport_hold;
+            m_position_seconds = seconds;
+            m_render_seconds = seconds;
+            m_scrub_audible_until = 0;
+        }
+        cache_manager().request_transport(seconds, false);
+    }
+
+    void set_scrub(double seconds) {
+        seconds = std::max(0.0, seconds);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_state = stem_transport_scrub;
+            m_position_seconds = seconds;
+            m_render_seconds = seconds;
+            m_scrub_audible_until = GetTickCount64() + 150;
+        }
+        cache_manager().request_transport(seconds, false);
+    }
+
+    void set_reverse(double seconds) {
+        seconds = std::max(0.0, seconds);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_state = stem_transport_reverse;
+            m_position_seconds = seconds;
+            m_render_seconds = seconds;
+            m_scrub_audible_until = 0;
+        }
+        cache_manager().request_transport(seconds, true);
+    }
+
+    void release_transport(double seconds) {
+        seconds = std::max(0.0, seconds);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_state = stem_transport_release_wait;
+            m_position_seconds = seconds;
+            m_render_seconds = seconds;
+            m_scrub_audible_until = 0;
+        }
+        cache_manager().request_transport(seconds, false);
+    }
+
+    void cancel() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_state = stem_transport_normal;
+        m_scrub_audible_until = 0;
+    }
+
+    transport_snapshot snapshot() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return transport_snapshot{
+            m_state, m_position_seconds, m_render_seconds, m_scrub_audible_until};
+    }
+
+    double visible_position() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_position_seconds;
+    }
+
+    int state() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_state;
+    }
+
+    void advance_scrub(double seconds) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_state == stem_transport_scrub) {
+            m_render_seconds = std::max(0.0, m_render_seconds + seconds);
+        }
+    }
+
+    void advance_reverse(double seconds) {
+        double next = 0.0;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_state != stem_transport_reverse) return;
+            m_render_seconds = std::max(0.0, m_render_seconds - seconds);
+            m_position_seconds = m_render_seconds;
+            next = m_render_seconds;
+        }
+        cache_manager().request_transport(next, true);
+    }
+
+    void finish_release() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_state == stem_transport_release_wait) {
+            m_state = stem_transport_normal;
+        }
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    int m_state = stem_transport_normal;
+    double m_position_seconds = 0.0;
+    double m_render_seconds = 0.0;
+    ULONGLONG m_scrub_audible_until = 0;
+};
+
+transport_controller& transport() {
+    static transport_controller instance;
+    return instance;
+}
+
+class stem_transport_service_impl : public stem_transport_service {
+public:
+    void set_hold(double seconds) override { transport().set_hold(seconds); }
+    void set_scrub(double seconds) override { transport().set_scrub(seconds); }
+    void set_reverse(double seconds) override { transport().set_reverse(seconds); }
+    void release_transport(double seconds) override { transport().release_transport(seconds); }
+    void cancel_transport() override { transport().cancel(); }
+    int get_state() override { return transport().state(); }
+    double get_position_seconds() override { return transport().visible_position(); }
+};
+
+static service_factory_single_t<stem_transport_service_impl>
+    g_stem_transport_service_factory;
+
 class stem_playback_observer :
     public play_callback_static {
 public:
@@ -1479,6 +1641,7 @@ public:
     void on_playback_new_track(
         metadb_handle_ptr track) override {
 
+        transport().cancel();
         cache_manager().new_track(
             local_path_from_metadb(
                 track));
@@ -1487,6 +1650,7 @@ public:
     void on_playback_stop(
         play_control::t_stop_reason) override {
 
+        transport().cancel();
         cache_manager().stop();
     }
 
@@ -1612,6 +1776,100 @@ public:
 
         const stemmode::mode mode =
             stemmode::get();
+
+        // Transport preview keeps foobar's audio clock running while replacing
+        // what is heard. That gives us a real stationary HOLD, audible jog, and
+        // 1x reverse without hammering playback_seek on every mouse/key event.
+        const transport_snapshot ts = transport().snapshot();
+        if (ts.state != stem_transport_normal) {
+            const double chunk_seconds =
+                static_cast<double>(frames) / static_cast<double>(rate);
+
+            auto write_silence = [&]() {
+                std::vector<audio_sample> zeros(frames * kCacheChannels, 0);
+                chunk->set_data(
+                    zeros.data(), frames, channels, rate, chunk->get_channel_config());
+            };
+
+            auto write_preview = [&](const std::vector<float>& rendered) {
+                std::vector<audio_sample> output(rendered.size());
+                for (size_t i = 0; i < rendered.size(); ++i) {
+                    output[i] = static_cast<audio_sample>(rendered[i]);
+                }
+                chunk->set_data(
+                    output.data(), frames, channels, rate, chunk->get_channel_config());
+            };
+
+            if (ts.state == stem_transport_hold) {
+                write_silence();
+                m_position_seconds += chunk_seconds;
+                m_using_stem = false;
+                return true;
+            }
+
+            if (ts.state == stem_transport_scrub) {
+                if (GetTickCount64() <= ts.scrub_audible_until) {
+                    cache_manager().request_transport(ts.render_seconds, false);
+                    std::vector<float> preview;
+                    if (cache_manager().render(
+                            mode, ts.render_seconds, rate, frames, preview, false) &&
+                        preview.size() == frames * kCacheChannels) {
+                        write_preview(preview);
+                        transport().advance_scrub(chunk_seconds);
+                    } else {
+                        // Never substitute Original when a selected stem is missing.
+                        write_silence();
+                    }
+                } else {
+                    write_silence();
+                }
+                m_position_seconds += chunk_seconds;
+                m_using_stem = false;
+                return true;
+            }
+
+            if (ts.state == stem_transport_reverse) {
+                cache_manager().request_transport(ts.render_seconds, true);
+                std::vector<float> preview;
+                if (cache_manager().render(
+                        mode, ts.render_seconds, rate, frames, preview, true) &&
+                    preview.size() == frames * kCacheChannels) {
+                    write_preview(preview);
+                    transport().advance_reverse(chunk_seconds);
+                } else {
+                    // Hold the reverse cursor until the selected rendition exists.
+                    write_silence();
+                }
+                m_position_seconds += chunk_seconds;
+                m_using_stem = false;
+                return true;
+            }
+
+            if (ts.state == stem_transport_release_wait) {
+                if (mode == stemmode::mode::original) {
+                    transport().finish_release();
+                    m_position_seconds += chunk_seconds;
+                    m_using_stem = false;
+                    return true;
+                }
+
+                cache_manager().request_transport(m_position_seconds, false);
+                std::vector<float> preview;
+                if (cache_manager().render(
+                        mode, m_position_seconds, rate, frames, preview, false) &&
+                    preview.size() == frames * kCacheChannels) {
+                    write_preview(preview);
+                    transport().finish_release();
+                    m_using_stem = true;
+                } else {
+                    // Stem-safe release: wait silently rather than leaking Original.
+                    write_silence();
+                    m_using_stem = false;
+                }
+                m_position_seconds += chunk_seconds;
+                return true;
+            }
+        }
 
         // V26: optional track-start pre-cache.
         //
