@@ -1,0 +1,27 @@
+name: Apply scrub keepalive
+
+on:
+  push:
+    paths:
+      - '.github/scrub_keepalive_patch.py'
+      - '.github/workflows/apply-scrub-keepalive.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patch
+        run: python .github/scrub_keepalive_patch.py
+      - name: Commit source change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stem_dsp.cpp
+          git diff --cached --quiet && exit 0
+          git commit -m "Make audible scrub motion-aware"
+          git push
