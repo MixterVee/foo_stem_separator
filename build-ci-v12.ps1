@@ -39,7 +39,8 @@ $cppFiles = @(
 $hFiles = @(
     "stem_mode.h",
     "onnx_stem_engine.h",
-    "stem_waveform_provider.h"
+    "stem_waveform_provider.h",
+    "stem_transport_service.h"
 )
 
 foreach ($name in ($cppFiles + $hFiles)) {
