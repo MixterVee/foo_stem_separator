@@ -62,6 +62,10 @@ constexpr double kSwitchFadeSeconds = 0.050;
 constexpr double kCacheHandoffFadeSeconds = 0.080;
 constexpr double kDecodeSeekPrerollSeconds = 5.0;
 constexpr double kFirstBlockFadeSeconds = 0.005;
+// Spectral Waveform now explicitly returns scrub transport to HOLD after real
+// mouse motion stops. Keep this slightly longer timeout as a safety net only.
+constexpr ULONGLONG kScrubAudibleSafetyMs = 320;
+constexpr double kScrubKeepaliveToleranceSeconds = 0.002;
 
 std::wstring utf8_to_wide_cache(const char* s) {
     if (!s || !*s) return {};
@@ -1673,14 +1677,28 @@ public:
 
     void set_scrub(double seconds) {
         seconds = (std::max)(0.0, seconds);
+        bool retarget = true;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
+            retarget =
+                m_state != stem_transport_scrub ||
+                std::abs(seconds - m_position_seconds) >
+                    kScrubKeepaliveToleranceSeconds;
+
             m_state = stem_transport_scrub;
             m_position_seconds = seconds;
-            m_render_seconds = seconds;
-            m_scrub_audible_until = GetTickCount64() + 150;
+            if (retarget) {
+                m_render_seconds = seconds;
+            }
+            m_scrub_audible_until =
+                GetTickCount64() + kScrubAudibleSafetyMs;
         }
-        cache_manager().request_transport(seconds, false);
+
+        // A timer keepalive for the same mouse target should extend audibility
+        // only. Do not restart rendering or enqueue another cache request.
+        if (retarget) {
+            cache_manager().request_transport(seconds, false);
+        }
     }
 
     void set_reverse(double seconds) {
