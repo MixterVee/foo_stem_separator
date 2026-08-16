@@ -26,4 +26,20 @@ public:
     virtual int get_state() = 0;
     virtual double get_position_seconds() = 0;
     virtual bool is_position_ready(double position_seconds) = 0;
+
+    // Spectral Waveform already pays the Spleeter cost while progressively
+    // building the Vocal/Instrumental waveform. Publish that exact separated
+    // PCM into the transport cache so jog/reverse can reuse it immediately
+    // instead of launching a second Spleeter pass for the same audio.
+    // Buffers are interleaved and remain owned by the caller; this method copies
+    // and normalizes them to the transport cache's internal 44.1-kHz stereo format.
+    virtual bool publish_cache_block(
+        const char* track_path_utf8,
+        double start_seconds,
+        const float* original,
+        const float* vocals,
+        const float* instrumental,
+        t_size frames,
+        unsigned channels,
+        unsigned sample_rate) = 0;
 };
