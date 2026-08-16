@@ -1,0 +1,25 @@
+name: Apply lazy ONNX for Original scratch
+
+on:
+  push:
+    paths:
+      - '.github/lazy_onnx_for_original_patch.py'
+      - '.github/workflows/apply-lazy-onnx-for-original.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patch
+        run: python .github/lazy_onnx_for_original_patch.py
+      - name: Commit source change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stem_dsp.cpp
+          git commit -m "Start Original scratch cache before ONNX initialization"
+          git push
