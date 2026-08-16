@@ -25,4 +25,5 @@ public:
 
     virtual int get_state() = 0;
     virtual double get_position_seconds() = 0;
+    virtual bool is_position_ready(double position_seconds) = 0;
 };
