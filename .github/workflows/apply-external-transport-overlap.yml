@@ -1,0 +1,27 @@
+name: Apply external transport overlap blending
+
+on:
+  push:
+    paths:
+      - '.github/blend_external_transport_overlap.py'
+      - '.github/workflows/apply-external-transport-overlap.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patch
+        run: python .github/blend_external_transport_overlap.py
+      - name: Commit source change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stem_dsp.cpp
+          git diff --cached --quiet && exit 0
+          git commit -m "Blend overlapping waveform transport PCM tiles"
+          git push
