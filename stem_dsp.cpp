@@ -615,14 +615,19 @@ public:
             const cache_segment* first = nullptr;
             const cache_segment* second = nullptr;
 
-            // Prefer the newest Spectral Waveform PCM tile. It already contains
-            // the contextual Spleeter result that produced the visible waveform,
-            // so using it avoids both duplicate inference and transport delay.
-            for (auto it = snapshot.rbegin(); it != snapshot.rend(); ++it) {
-                if (!it->external_waveform || !segment_has_mode(*it, mode)) continue;
-                if (t >= it->start_seconds && t < it->end_seconds) {
-                    first = &*it;
-                    break;
+            // Prefer Spectral Waveform PCM. Widened contextual publishes overlap
+            // adjacent 5-second tiles, so retain the two time-adjacent external
+            // segments when both cover this sample and crossfade their handoff
+            // below. This avoids both duplicate inference and hard tile seams.
+            for (const auto& seg : snapshot) {
+                if (!seg.external_waveform || !segment_has_mode(seg, mode)) continue;
+                if (t < seg.start_seconds || t >= seg.end_seconds) continue;
+
+                if (!first || seg.start_seconds < first->start_seconds) {
+                    second = first;
+                    first = &seg;
+                } else if (!second || seg.start_seconds < second->start_seconds) {
+                    second = &seg;
                 }
             }
 
@@ -714,7 +719,7 @@ public:
                         *first,
                         ch);
 
-                if (second && !first->external_waveform) {
+                if (second) {
                     const double overlap_start =
                         second->start_seconds;
 
