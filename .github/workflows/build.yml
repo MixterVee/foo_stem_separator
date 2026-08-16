@@ -64,13 +64,12 @@ jobs:
           "WTL_INCLUDE=$($h.Directory.FullName)" |
             Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Download foobar2000 SDK
+      - name: Get foobar2000 SDK
         shell: powershell
         run: |
-          $sdkUrl = "https://www.foobar2000.org/downloads/SDK-2025-03-07.7z"
-          Invoke-WebRequest $sdkUrl -OutFile "$env:RUNNER_TEMP\foobar2000-sdk.7z"
-          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\foobar2000-sdk" | Out-Null
-          7z x "$env:RUNNER_TEMP\foobar2000-sdk.7z" "-o$env:RUNNER_TEMP\foobar2000-sdk" -y
+          $sdkRoot = "$env:RUNNER_TEMP\foobar2000-sdk"
+          git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git $sdkRoot
+          if (-not (Test-Path $sdkRoot)) { throw "foobar2000 SDK clone failed." }
 
       - name: Build ONNX component
         shell: powershell
