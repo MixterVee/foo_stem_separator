@@ -62,7 +62,11 @@ constexpr double kPrefetchSeconds = 20.0;
 // Original PCM is cheap to decode, so keep a smaller trigger margin around the
 // playhead continuously. This makes the very first platter grab audible instead
 // of waiting for a transport request after the mouse is already down.
-constexpr double kOriginalPrefetchSeconds = 5.0;
+// Original transport does not need a 20-second analysis block. Publish a
+// compact decoder-only window quickly, then keep extending it in the background.
+constexpr double kOriginalQuickCacheSeconds = 4.0;
+constexpr double kOriginalQuickOverlapSeconds = 0.75;
+constexpr double kOriginalPrefetchSeconds = 1.5;
 constexpr double kSwitchFadeSeconds = 0.050;
 constexpr double kCacheHandoffFadeSeconds = 0.080;
 constexpr double kDecodeSeekPrerollSeconds = 5.0;
@@ -415,12 +419,11 @@ public:
                 // transport request made by set_hold(), leaving SCRUB with no PCM
                 // until the mouse had already moved. Re-prime a cheap decoder-only
                 // transport window here. No Spleeter inference is involved.
-                // Center the cheap 20-second Original window on the grab point.
-                // A forward-biased window left only 0.5 s available for an
-                // immediate backward scratch. Centering gives the platter useful
-                // cached travel in both directions before any follow-up prefetch.
+                // Center a compact Original window on the grab point. It is
+                // decoder-only and is intentionally much smaller than a stem
+                // analysis block so first-motion PCM becomes available quickly.
                 const double preview_start = (std::max)(
-                    0.0, seconds - kCacheSeconds * 0.5);
+                    0.0, seconds - kOriginalQuickCacheSeconds * 0.5);
                 m_jobs.emplace_front(cache_job{
                     m_generation, m_path, preview_start, true, true, false});
                 m_job_pending = true;
@@ -472,15 +475,15 @@ public:
             double next = 0.0;
             if (covering_end < 0.0) {
                 // A seek/jump landed outside cached Original PCM. Center a fresh
-                // 20-second window so both scratch directions become available.
+                // quick window so both scratch directions become available fast.
                 next = (std::max)(
-                    0.0, playback_seconds - kCacheSeconds * 0.5);
+                    0.0, playback_seconds - kOriginalQuickCacheSeconds * 0.5);
             } else if (covering_end - playback_seconds <=
                        kOriginalPrefetchSeconds) {
                 // Extend ahead with the normal overlap before the playhead reaches
                 // the current window edge.
                 next = (std::max)(
-                    0.0, covering_end - kCacheOverlapSeconds);
+                    0.0, covering_end - kOriginalQuickOverlapSeconds);
             } else {
                 return;
             }
@@ -634,9 +637,16 @@ public:
             else ++it;
         }
 
+        const bool original_preview = mode == stemmode::mode::original;
+        const double transport_window = original_preview
+            ? kOriginalQuickCacheSeconds
+            : kCacheSeconds;
+        const double edge_preroll = original_preview ? 0.25 : 0.5;
+
         double start = reverse
-            ? (std::max)(0.0, position_seconds - (kCacheSeconds - 0.5))
-            : (std::max)(0.0, position_seconds - 0.5);
+            ? (std::max)(0.0, position_seconds -
+                (transport_window - edge_preroll))
+            : (std::max)(0.0, position_seconds - edge_preroll);
 
         m_jobs.emplace_front(cache_job{
             m_generation, m_path, start, true, true,
@@ -1250,6 +1260,8 @@ private:
         sequential_decoder_state& state,
         double requested_start_seconds,
         bool force_reanchor,
+        double window_seconds,
+        double overlap_seconds,
         std::vector<float>& audio) {
 
         if (!state.valid) {
@@ -1265,7 +1277,7 @@ private:
 
         const uint64_t window_frames =
             static_cast<uint64_t>(
-                kCacheSeconds *
+                window_seconds *
                 static_cast<double>(
                     kCacheRate) +
                 0.5);
@@ -1359,8 +1371,7 @@ private:
 
         const uint64_t hop_frames =
             static_cast<uint64_t>(
-                (kCacheSeconds -
-                 kCacheOverlapSeconds) *
+                ((std::max)(0.001, window_seconds - overlap_seconds)) *
                 static_cast<double>(
                     kCacheRate) +
                 0.5);
@@ -1552,11 +1563,20 @@ private:
                         }
                     }
 
+                    const double decode_window = job.need_stems
+                        ? kCacheSeconds
+                        : kOriginalQuickCacheSeconds;
+                    const double decode_overlap = job.need_stems
+                        ? kCacheOverlapSeconds
+                        : kOriginalQuickOverlapSeconds;
+
                     const bool decoded =
                         decode_exact_block(
                             active_decoder,
                             job.start_seconds,
                             job.force_reanchor,
+                            decode_window,
+                            decode_overlap,
                             input);
 
                     std::vector<float> vocals;
