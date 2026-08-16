@@ -1,0 +1,26 @@
+name: Apply Windows max macro transport fix
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-fix-transport-max.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply source patch
+        run: python .github/fix_transport_max.py
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stem_dsp.cpp
+          git commit -m "Fix Windows max macro in transport engine"
+          git push
