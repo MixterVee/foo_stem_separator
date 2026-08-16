@@ -411,7 +411,7 @@ public:
         // travel. If it is already cached, no worker job is necessary.
         const double margin = 0.35;
         const double need_start = reverse
-            ? std::max(0.0, position_seconds - margin)
+            ? (std::max)(0.0, position_seconds - margin)
             : position_seconds;
         const double need_end = reverse
             ? position_seconds
@@ -433,8 +433,8 @@ public:
         }
 
         double start = reverse
-            ? std::max(0.0, position_seconds - (kCacheSeconds - 0.5))
-            : std::max(0.0, position_seconds - 0.5);
+            ? (std::max)(0.0, position_seconds - (kCacheSeconds - 0.5))
+            : (std::max)(0.0, position_seconds - 0.5);
 
         m_jobs.emplace_front(cache_job{
             m_generation, m_path, start, true, true,
@@ -1517,7 +1517,7 @@ struct transport_snapshot {
 class transport_controller {
 public:
     void set_hold(double seconds) {
-        seconds = std::max(0.0, seconds);
+        seconds = (std::max)(0.0, seconds);
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_state = stem_transport_hold;
@@ -1529,7 +1529,7 @@ public:
     }
 
     void set_scrub(double seconds) {
-        seconds = std::max(0.0, seconds);
+        seconds = (std::max)(0.0, seconds);
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_state = stem_transport_scrub;
@@ -1541,7 +1541,7 @@ public:
     }
 
     void set_reverse(double seconds) {
-        seconds = std::max(0.0, seconds);
+        seconds = (std::max)(0.0, seconds);
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_state = stem_transport_reverse;
@@ -1553,7 +1553,7 @@ public:
     }
 
     void release_transport(double seconds) {
-        seconds = std::max(0.0, seconds);
+        seconds = (std::max)(0.0, seconds);
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_state = stem_transport_release_wait;
@@ -1589,7 +1589,7 @@ public:
     void advance_scrub(double seconds) {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_state == stem_transport_scrub) {
-            m_render_seconds = std::max(0.0, m_render_seconds + seconds);
+            m_render_seconds = (std::max)(0.0, m_render_seconds + seconds);
         }
     }
 
@@ -1598,7 +1598,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_state != stem_transport_reverse) return;
-            m_render_seconds = std::max(0.0, m_render_seconds - seconds);
+            m_render_seconds = (std::max)(0.0, m_render_seconds - seconds);
             m_position_seconds = m_render_seconds;
             next = m_render_seconds;
         }
