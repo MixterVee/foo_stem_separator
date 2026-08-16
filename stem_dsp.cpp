@@ -59,6 +59,10 @@ constexpr unsigned kCacheChannels = 2;
 constexpr double kCacheSeconds = 20.0;
 constexpr double kCacheOverlapSeconds = 3.0;
 constexpr double kPrefetchSeconds = 20.0;
+// Original PCM is cheap to decode, so keep a smaller trigger margin around the
+// playhead continuously. This makes the very first platter grab audible instead
+// of waiting for a transport request after the mouse is already down.
+constexpr double kOriginalPrefetchSeconds = 5.0;
 constexpr double kSwitchFadeSeconds = 0.050;
 constexpr double kCacheHandoffFadeSeconds = 0.080;
 constexpr double kDecodeSeekPrerollSeconds = 5.0;
@@ -361,11 +365,18 @@ public:
         m_jobs.clear();
         m_job_pending = false;
 
-        if (!m_path.empty() &&
-            stemmode::get() !=
-                stemmode::mode::original) {
-
-            queue_job_locked(0.0, true);
+        if (!m_path.empty()) {
+            const stemmode::mode mode = stemmode::get();
+            if (mode != stemmode::mode::original) {
+                queue_job_locked(0.0, true);
+            } else {
+                // Pre-decode the first Original transport window immediately.
+                // Unlike stem caching this is just Media Foundation decode and is
+                // cheap enough to keep ready for platter work all the time.
+                m_jobs.emplace_back(cache_job{
+                    m_generation, m_path, 0.0, true, false, false});
+                m_job_pending = true;
+            }
         }
 
         m_cv.notify_one();
@@ -435,16 +446,49 @@ public:
     }
 
     void ensure_ahead(double playback_seconds) {
-        if (stemmode::get() ==
-            stemmode::mode::original) {
-            return;
-        }
+        const stemmode::mode mode = stemmode::get();
 
         std::lock_guard<std::mutex> lock(
             m_mutex);
 
         if (m_path.empty() ||
             m_job_pending) {
+            return;
+        }
+
+        if (mode == stemmode::mode::original) {
+            // Find Original PCM that actually covers the playhead. Completed
+            // windows are retained, so this also gives scratch useful history.
+            double covering_end = -1.0;
+            for (const auto& seg_ptr : m_segments) {
+                const cache_segment& seg = *seg_ptr;
+                if (!segment_has_mode(seg, mode)) continue;
+                if (playback_seconds >= seg.start_seconds - 1.0e-6 &&
+                    playback_seconds < seg.end_seconds) {
+                    covering_end = (std::max)(covering_end, seg.end_seconds);
+                }
+            }
+
+            double next = 0.0;
+            if (covering_end < 0.0) {
+                // A seek/jump landed outside cached Original PCM. Center a fresh
+                // 20-second window so both scratch directions become available.
+                next = (std::max)(
+                    0.0, playback_seconds - kCacheSeconds * 0.5);
+            } else if (covering_end - playback_seconds <=
+                       kOriginalPrefetchSeconds) {
+                // Extend ahead with the normal overlap before the playhead reaches
+                // the current window edge.
+                next = (std::max)(
+                    0.0, covering_end - kCacheOverlapSeconds);
+            } else {
+                return;
+            }
+
+            m_jobs.emplace_back(cache_job{
+                m_generation, m_path, next, true, false, false});
+            m_job_pending = true;
+            m_cv.notify_one();
             return;
         }
 
