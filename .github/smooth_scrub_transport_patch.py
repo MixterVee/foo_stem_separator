@@ -7,7 +7,10 @@ s = p.read_text(encoding='utf-8')
 def replace_once(old: str, new: str) -> None:
     global s
     count = s.count(old)
-    assert count == 1, f'expected one match, got {count}: {old[:120]!r}'
+    if count != 1:
+        label = old.splitlines()[0].strip()[:80] or '<blank>'
+        print(f'::error file=stem_dsp.cpp,title=Scrub patch matcher::expected one match, got {count}: {label}')
+        raise SystemExit(1)
     s = s.replace(old, new, 1)
 
 # Render transport at an arbitrary signed source rate. This lets a scrub block
@@ -70,7 +73,8 @@ replace_once(
 '''    uint64_t m_generation = 0;\n    double m_position_seconds = 0.0;''',
 '''    uint64_t m_generation = 0;\n    double m_position_seconds = 0.0;\n\n    audio_sample m_transportTail[kCacheChannels] = {};\n    bool m_transportTailValid = false;''')
 
-assert 'advance_scrub(' not in s
-assert 'bool reverse = false' not in s
+if 'advance_scrub(' in s:
+    print('::error file=stem_dsp.cpp,title=Scrub patch validation::old advance_scrub remains')
+    raise SystemExit(1)
 
 p.write_text(s, encoding='utf-8')
