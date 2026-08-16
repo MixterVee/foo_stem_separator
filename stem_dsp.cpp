@@ -393,11 +393,22 @@ public:
         m_jobs.clear();
         m_job_pending = false;
 
-        if (!m_path.empty() &&
-            stemmode::get() !=
-                stemmode::mode::original) {
+        if (!m_path.empty()) {
+            const stemmode::mode mode = stemmode::get();
 
-            queue_job_locked(seconds, true);
+            if (mode != stemmode::mode::original) {
+                queue_job_locked(seconds, true);
+            } else {
+                // Spectral Waveform arms HOLD and then seeks to the same sample
+                // to flush queued output. That seek used to clear the Original
+                // transport request made by set_hold(), leaving SCRUB with no PCM
+                // until the mouse had already moved. Re-prime a cheap decoder-only
+                // transport window here. No Spleeter inference is involved.
+                const double preview_start = (std::max)(0.0, seconds - 0.5);
+                m_jobs.emplace_front(cache_job{
+                    m_generation, m_path, preview_start, true, true, false});
+                m_job_pending = true;
+            }
         }
 
         m_cv.notify_one();
