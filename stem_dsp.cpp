@@ -404,7 +404,12 @@ public:
                 // transport request made by set_hold(), leaving SCRUB with no PCM
                 // until the mouse had already moved. Re-prime a cheap decoder-only
                 // transport window here. No Spleeter inference is involved.
-                const double preview_start = (std::max)(0.0, seconds - 0.5);
+                // Center the cheap 20-second Original window on the grab point.
+                // A forward-biased window left only 0.5 s available for an
+                // immediate backward scratch. Centering gives the platter useful
+                // cached travel in both directions before any follow-up prefetch.
+                const double preview_start = (std::max)(
+                    0.0, seconds - kCacheSeconds * 0.5);
                 m_jobs.emplace_front(cache_job{
                     m_generation, m_path, preview_start, true, true, false});
                 m_job_pending = true;
