@@ -557,7 +557,7 @@ public:
 
         // Require a little playable material on the side in which transport will
         // travel. If it is already cached, no worker job is necessary.
-        const double margin = 0.35;
+        const double margin = 1.25;
         const double need_start = reverse
             ? (std::max)(0.0, position_seconds - margin)
             : position_seconds;
@@ -2162,27 +2162,60 @@ public:
                     source_rate = std::clamp(
                         source_rate, -kScrubMaxSourceRate, kScrubMaxSourceRate);
 
-                    const double next_render = (std::max)(
+                    const double desired_next_render = (std::max)(
                         0.0, ts.render_seconds + source_rate * chunk_seconds);
+
+                    // Prefetch toward the full hand-speed destination even if this
+                    // callback later has to use a slower cached fallback. This lets
+                    // the renderer catch the hand as soon as PCM becomes available.
                     cache_manager().request_transport(
-                        next_render, source_rate < 0.0);
+                        desired_next_render, source_rate < 0.0);
 
                     std::vector<float> preview;
-                    if (std::abs(source_rate) > 1.0e-6 &&
-                        cache_manager().render(
-                            mode, ts.render_seconds, rate, frames,
-                            preview, source_rate) &&
-                        preview.size() == frames * kCacheChannels) {
-                        write_preview(preview);
-                    } else {
-                        write_silence();
+                    bool rendered_ok = false;
+                    double rendered_rate = source_rate;
+
+                    // A fast gesture can cross the edge of the currently cached
+                    // transport window. Do not turn that one boundary miss into a
+                    // whole silent block. Retry using progressively shorter source
+                    // spans that stay closer to the last known-good audible cursor.
+                    // The requested full-speed destination remains queued above.
+                    constexpr double kFallbackScales[] = {
+                        1.0, 0.75, 0.50, 0.25
+                    };
+
+                    if (std::abs(source_rate) > 1.0e-6) {
+                        for (double scale : kFallbackScales) {
+                            const double trial_rate = source_rate * scale;
+                            preview.clear();
+                            if (cache_manager().render(
+                                    mode, ts.render_seconds, rate, frames,
+                                    preview, trial_rate) &&
+                                preview.size() == frames * kCacheChannels) {
+                                rendered_rate = trial_rate;
+                                rendered_ok = true;
+                                break;
+                            }
+                        }
                     }
 
-                    // Advance by what was actually rendered, not by snapping to the
-                    // latest mouse target. That keeps the audio trajectory continuous
-                    // across callback boundaries while the small phase correction
-                    // keeps it visually aligned.
-                    transport().complete_scrub(next_render);
+                    if (rendered_ok) {
+                        write_preview(preview);
+
+                        // Advance only by audio that was actually produced. The old
+                        // wall-clock build advanced to next_render even after render()
+                        // failed, pushing the next callback deeper into uncached PCM
+                        // and creating the silence cascade seen in the recording.
+                        const double rendered_next = (std::max)(
+                            0.0,
+                            ts.render_seconds + rendered_rate * chunk_seconds);
+                        transport().complete_scrub(rendered_next);
+                    } else {
+                        // Hold the last known-good audible cursor while the requested
+                        // destination is being prefetched. A later callback retries
+                        // from valid PCM instead of skipping over the missing region.
+                        write_silence();
+                    }
                 } else {
                     write_silence();
                     if (std::abs(delta) > move_epsilon) {
