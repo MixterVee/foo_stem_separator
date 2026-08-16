@@ -584,7 +584,7 @@ public:
         unsigned output_rate,
         size_t frames,
         std::vector<float>& out,
-        bool reverse = false) {
+        double source_rate = 1.0) {
 
         if (output_rate == 0 ||
             frames == 0) {
@@ -620,10 +620,9 @@ public:
              f < frames;
              ++f) {
 
-            const double direction = reverse ? -1.0 : 1.0;
             const double t =
                 start_seconds +
-                direction * static_cast<double>(f) * dt;
+                source_rate * static_cast<double>(f) * dt;
 
             if (t < 0.0) return false;
 
@@ -1692,26 +1691,39 @@ public:
     void set_scrub(double seconds) {
         seconds = (std::max)(0.0, seconds);
         bool retarget = true;
+        bool reverse = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
+            const int previous_state = m_state;
             retarget =
-                m_state != stem_transport_scrub ||
+                previous_state != stem_transport_scrub ||
                 std::abs(seconds - m_position_seconds) >
                     kScrubKeepaliveToleranceSeconds;
 
-            m_state = stem_transport_scrub;
-            m_position_seconds = seconds;
-            if (retarget) {
+            // A centered grab enters from HOLD, whose render cursor is the exact
+            // sample that was under the playhead when the platter was grabbed.
+            // Preserve that cursor so the first audible block also follows the
+            // hand instead of jumping straight to the new target.
+            if (previous_state != stem_transport_scrub &&
+                previous_state != stem_transport_hold) {
                 m_render_seconds = seconds;
             }
-            m_scrub_audible_until =
-                GetTickCount64() + kScrubAudibleSafetyMs;
+
+            reverse = seconds < m_render_seconds;
+            m_state = stem_transport_scrub;
+            m_position_seconds = seconds;
+
+            // Only real target movement opens an audible scrub window. Repeated
+            // keepalives for an unchanged target must never make a stopped
+            // platter emit another piece of audio.
+            if (retarget) {
+                m_scrub_audible_until =
+                    GetTickCount64() + kScrubAudibleSafetyMs;
+            }
         }
 
-        // A timer keepalive for the same mouse target should extend audibility
-        // only. Do not restart rendering or enqueue another cache request.
         if (retarget) {
-            cache_manager().request_transport(seconds, false);
+            cache_manager().request_transport(seconds, reverse);
         }
     }
 
@@ -1761,10 +1773,10 @@ public:
         return m_state;
     }
 
-    void advance_scrub(double seconds) {
+    void complete_scrub(double seconds) {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_state == stem_transport_scrub) {
-            m_render_seconds = (std::max)(0.0, m_render_seconds + seconds);
+            m_render_seconds = (std::max)(0.0, seconds);
         }
     }
 
@@ -1996,6 +2008,26 @@ public:
 
             auto write_silence = [&]() {
                 std::vector<audio_sample> zeros(frames * kCacheChannels, 0);
+
+                if (m_transportTailValid && frames != 0) {
+                    const size_t fade_frames = (std::min)(
+                        frames,
+                        (std::max)(static_cast<size_t>(1),
+                            static_cast<size_t>(static_cast<double>(rate) * 0.0025)));
+
+                    for (size_t f = 0; f < fade_frames; ++f) {
+                        const double gain =
+                            1.0 - static_cast<double>(f + 1) /
+                                static_cast<double>(fade_frames);
+                        for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
+                            zeros[f * kCacheChannels + ch] =
+                                static_cast<audio_sample>(
+                                    static_cast<double>(m_transportTail[ch]) * gain);
+                        }
+                    }
+                    m_transportTailValid = false;
+                }
+
                 chunk->set_data(
                     zeros.data(), frames, channels, rate, chunk->get_channel_config());
             };
@@ -2005,8 +2037,35 @@ public:
                 for (size_t i = 0; i < rendered.size(); ++i) {
                     output[i] = static_cast<audio_sample>(rendered[i]);
                 }
+
+                if (m_transportTailValid && frames != 0) {
+                    const size_t blend_frames = (std::min)(
+                        frames,
+                        (std::max)(static_cast<size_t>(1),
+                            static_cast<size_t>(static_cast<double>(rate) * 0.0010)));
+                    for (size_t f = 0; f < blend_frames; ++f) {
+                        const double alpha =
+                            static_cast<double>(f + 1) /
+                            static_cast<double>(blend_frames);
+                        for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
+                            const size_t i = f * kCacheChannels + ch;
+                            output[i] = static_cast<audio_sample>(
+                                static_cast<double>(m_transportTail[ch]) * (1.0 - alpha) +
+                                static_cast<double>(output[i]) * alpha);
+                        }
+                    }
+                }
+
                 chunk->set_data(
                     output.data(), frames, channels, rate, chunk->get_channel_config());
+
+                if (frames != 0) {
+                    const size_t last = (frames - 1) * kCacheChannels;
+                    for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
+                        m_transportTail[ch] = output[last + ch];
+                    }
+                    m_transportTailValid = true;
+                }
             };
 
             if (ts.state == stem_transport_hold) {
@@ -2017,20 +2076,50 @@ public:
             }
 
             if (ts.state == stem_transport_scrub) {
-                if (GetTickCount64() <= ts.scrub_audible_until) {
-                    cache_manager().request_transport(ts.render_seconds, false);
+                const double delta =
+                    ts.position_seconds - ts.render_seconds;
+                const double move_epsilon =
+                    0.5 / static_cast<double>(rate);
+                const bool fresh_motion =
+                    GetTickCount64() <= ts.scrub_audible_until;
+
+                if (fresh_motion && std::abs(delta) > move_epsilon) {
+                    // Map the exact hand movement onto one output block. Positive
+                    // delta plays forward, negative delta plays backward, and the
+                    // magnitude naturally changes pitch/speed like a real platter.
+                    const double output_span =
+                        frames > 1
+                            ? static_cast<double>(frames - 1) /
+                                static_cast<double>(rate)
+                            : chunk_seconds;
+                    const double source_rate =
+                        output_span > 0.0 ? delta / output_span : 0.0;
+
+                    cache_manager().request_transport(
+                        ts.position_seconds, source_rate < 0.0);
+
                     std::vector<float> preview;
-                    if (cache_manager().render(
-                            mode, ts.render_seconds, rate, frames, preview, false) &&
+                    if (source_rate != 0.0 &&
+                        cache_manager().render(
+                            mode, ts.render_seconds, rate, frames, preview, source_rate) &&
                         preview.size() == frames * kCacheChannels) {
                         write_preview(preview);
-                        transport().advance_scrub(chunk_seconds);
                     } else {
-                        // Never substitute Original when a selected stem is missing.
+                        // Never play a delayed stale slice after the hand has moved
+                        // on. Missing cache is silence for this gesture block.
                         write_silence();
                     }
+
+                    // Whether audible or not, consume this exact mouse movement.
+                    // A stationary target therefore has no queued audio left.
+                    transport().complete_scrub(ts.position_seconds);
                 } else {
                     write_silence();
+                    if (std::abs(delta) > move_epsilon) {
+                        // The safety window expired before this movement could be
+                        // rendered. Discard it rather than producing a late burst.
+                        transport().complete_scrub(ts.position_seconds);
+                    }
                 }
                 m_position_seconds += chunk_seconds;
                 m_using_stem = false;
@@ -2041,7 +2130,7 @@ public:
                 cache_manager().request_transport(ts.render_seconds, true);
                 std::vector<float> preview;
                 if (cache_manager().render(
-                        mode, ts.render_seconds, rate, frames, preview, true) &&
+                        mode, ts.render_seconds, rate, frames, preview, -1.0) &&
                     preview.size() == frames * kCacheChannels) {
                     write_preview(preview);
                     transport().advance_reverse(chunk_seconds);
@@ -2065,7 +2154,7 @@ public:
                 cache_manager().request_transport(m_position_seconds, false);
                 std::vector<float> preview;
                 if (cache_manager().render(
-                        mode, m_position_seconds, rate, frames, preview, false) &&
+                        mode, m_position_seconds, rate, frames, preview, 1.0) &&
                     preview.size() == frames * kCacheChannels) {
                     write_preview(preview);
                     transport().finish_release();
@@ -2079,6 +2168,8 @@ public:
                 return true;
             }
         }
+
+        m_transportTailValid = false;
 
         // V26: optional track-start pre-cache.
         //
@@ -2261,6 +2352,7 @@ public:
         m_have_position = false;
         m_using_stem = false;
         m_precache_handled = false;
+        m_transportTailValid = false;
     }
 
     double get_latency() override {
@@ -2279,6 +2371,9 @@ private:
         m_precache_handled = false;
         m_position_seconds = 0.0;
         m_generation = 0;
+        m_transportTailValid = false;
+        m_transportTail[0] = 0;
+        m_transportTail[1] = 0;
     }
 
     bool m_have_position = false;
@@ -2287,6 +2382,9 @@ private:
 
     uint64_t m_generation = 0;
     double m_position_seconds = 0.0;
+
+    audio_sample m_transportTail[kCacheChannels] = {};
+    bool m_transportTailValid = false;
 };
 
 static dsp_factory_t<stem_dsp>
