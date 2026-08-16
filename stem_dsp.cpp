@@ -104,6 +104,69 @@ std::wstring local_path_from_metadb(
     return path;
 }
 
+std::wstring local_path_from_utf8_cache(const char* raw) {
+    std::wstring path = utf8_to_wide_cache(raw);
+    const std::wstring prefix = L"file://";
+    if (path.rfind(prefix, 0) == 0) path.erase(0, prefix.size());
+    return path;
+}
+
+bool convert_to_cache_stereo(
+    const float* input,
+    size_t frames,
+    unsigned channels,
+    unsigned sample_rate,
+    std::vector<float>& out) {
+
+    out.clear();
+    if (input == nullptr || frames == 0 || channels == 0 || sample_rate == 0) return false;
+
+    size_t output_frames = frames;
+    if (sample_rate != kCacheRate) {
+        output_frames = (std::max)(
+            static_cast<size_t>(1),
+            static_cast<size_t>(std::llround(
+                static_cast<double>(frames) *
+                static_cast<double>(kCacheRate) /
+                static_cast<double>(sample_rate))));
+    }
+
+    out.assign(output_frames * kCacheChannels, 0.0f);
+
+    auto read_channel = [input, channels, frames](size_t frame, unsigned ch) -> float {
+        frame = (std::min)(frame, frames - 1);
+        const float* src = input + frame * channels;
+        if (channels == 1) return src[0];
+        return src[ch == 0 ? 0 : 1];
+    };
+
+    if (frames == 1 || output_frames == 1) {
+        const float l = read_channel(0, 0);
+        const float r = read_channel(0, 1);
+        for (size_t i = 0; i < output_frames; ++i) {
+            out[i * 2] = l;
+            out[i * 2 + 1] = r;
+        }
+        return true;
+    }
+
+    const double scale = static_cast<double>(frames - 1) /
+        static_cast<double>(output_frames - 1);
+
+    for (size_t i = 0; i < output_frames; ++i) {
+        const double source = static_cast<double>(i) * scale;
+        const size_t i0 = static_cast<size_t>(source);
+        const size_t i1 = (std::min)(i0 + 1, frames - 1);
+        const float frac = static_cast<float>(source - static_cast<double>(i0));
+        for (unsigned ch = 0; ch < 2; ++ch) {
+            const float a = read_channel(i0, ch);
+            const float b = read_channel(i1, ch);
+            out[i * 2 + ch] = a + (b - a) * frac;
+        }
+    }
+    return true;
+}
+
 struct cache_segment {
     uint64_t generation = 0;
     double start_seconds = 0.0;
@@ -114,6 +177,11 @@ struct cache_segment {
     std::vector<float> original;
     std::vector<float> vocals;
     std::vector<float> instrumental;
+
+    // True when this PCM was produced by Spectral Waveform's contextual stem
+    // analysis. These blocks are preferred for jog/reverse so we never pay a
+    // second Spleeter pass for an already processed visible region.
+    bool external_waveform = false;
 };
 
 struct cache_job {
@@ -384,6 +452,65 @@ public:
         }
     }
 
+    bool publish_external_segment(
+        const std::wstring& path,
+        double start_seconds,
+        const float* original,
+        const float* vocals,
+        const float* instrumental,
+        size_t frames,
+        unsigned channels,
+        unsigned sample_rate) {
+
+        if (path.empty() || start_seconds < 0.0) return false;
+
+        std::vector<float> cache_original;
+        std::vector<float> cache_vocals;
+        std::vector<float> cache_instrumental;
+        if (!convert_to_cache_stereo(original, frames, channels, sample_rate, cache_original) ||
+            !convert_to_cache_stereo(vocals, frames, channels, sample_rate, cache_vocals) ||
+            !convert_to_cache_stereo(instrumental, frames, channels, sample_rate, cache_instrumental)) {
+            return false;
+        }
+        if (cache_original.empty() || cache_vocals.size() != cache_original.size() ||
+            cache_instrumental.size() != cache_original.size()) return false;
+
+        const size_t cache_frames = cache_original.size() / kCacheChannels;
+        if (cache_frames == 0) return false;
+        const double end_seconds = start_seconds +
+            static_cast<double>(cache_frames) / static_cast<double>(kCacheRate);
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_path.empty() || _wcsicmp(m_path.c_str(), path.c_str()) != 0) return false;
+
+            // A re-analysis can republish the same tile. Replace the previous
+            // external copy instead of growing the in-memory cache indefinitely.
+            for (auto it = m_segments.begin(); it != m_segments.end();) {
+                if (it->external_waveform &&
+                    std::abs(it->start_seconds - start_seconds) < 0.001 &&
+                    std::abs(it->end_seconds - end_seconds) < 0.003) {
+                    it = m_segments.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            cache_segment seg;
+            seg.generation = m_generation;
+            seg.start_seconds = start_seconds;
+            seg.end_seconds = end_seconds;
+            seg.original = std::move(cache_original);
+            seg.vocals = std::move(cache_vocals);
+            seg.instrumental = std::move(cache_instrumental);
+            seg.external_waveform = true;
+            m_segments.push_back(std::move(seg));
+        }
+
+        m_ready_cv.notify_all();
+        return true;
+    }
+
     bool transport_position_ready(double position_seconds) const {
         const stemmode::mode mode = stemmode::get();
         if (mode == stemmode::mode::original) return true;
@@ -417,13 +544,7 @@ public:
             ? position_seconds
             : position_seconds + margin;
 
-        for (const auto& seg : m_segments) {
-            if (!segment_has_mode(seg, mode)) continue;
-            if (seg.start_seconds <= need_start + 1.0e-6 &&
-                seg.end_seconds >= need_end - 1.0e-6) {
-                return;
-            }
-        }
+        if (range_ready_locked(mode, need_start, need_end)) return;
 
         // Coalesce scrub requests: a slow Spleeter job must never build a queue of
         // obsolete mouse positions. The newest transport target goes to the front.
@@ -491,33 +612,31 @@ public:
 
             if (t < 0.0) return false;
 
-            const cache_segment* first =
-                nullptr;
+            const cache_segment* first = nullptr;
+            const cache_segment* second = nullptr;
 
-            const cache_segment* second =
-                nullptr;
-
-            for (const auto& seg :
-                 snapshot) {
-
-                if (!segment_has_mode(seg, mode)) continue;
-
-                if (t >= seg.start_seconds &&
-                    t < seg.end_seconds) {
-
-                    if (!first) {
-                        first = &seg;
-                    }
-                    else {
-                        second = &seg;
-                        break;
-                    }
+            // Prefer the newest Spectral Waveform PCM tile. It already contains
+            // the contextual Spleeter result that produced the visible waveform,
+            // so using it avoids both duplicate inference and transport delay.
+            for (auto it = snapshot.rbegin(); it != snapshot.rend(); ++it) {
+                if (!it->external_waveform || !segment_has_mode(*it, mode)) continue;
+                if (t >= it->start_seconds && t < it->end_seconds) {
+                    first = &*it;
+                    break;
                 }
             }
 
             if (!first) {
-                return false;
+                for (const auto& seg : snapshot) {
+                    if (seg.external_waveform || !segment_has_mode(seg, mode)) continue;
+                    if (t >= seg.start_seconds && t < seg.end_seconds) {
+                        if (!first) first = &seg;
+                        else { second = &seg; break; }
+                    }
+                }
             }
+
+            if (!first) return false;
 
             auto sample_from =
                 [mode, t](
@@ -595,7 +714,7 @@ public:
                         *first,
                         ch);
 
-                if (second) {
+                if (second && !first->external_waveform) {
                     const double overlap_start =
                         second->start_seconds;
 
@@ -682,6 +801,25 @@ private:
         if (mode == stemmode::mode::original) return !seg.original.empty();
         if (mode == stemmode::mode::vocals) return !seg.vocals.empty();
         return !seg.instrumental.empty();
+    }
+
+    bool range_ready_locked(stemmode::mode mode, double start_seconds, double end_seconds) const {
+        if (end_seconds <= start_seconds + 1.0e-6) return true;
+
+        double cursor = start_seconds;
+        while (cursor < end_seconds - 1.0e-6) {
+            double furthest = cursor;
+            for (const auto& seg : m_segments) {
+                if (!segment_has_mode(seg, mode)) continue;
+                if (seg.start_seconds <= cursor + 1.0e-6 &&
+                    seg.end_seconds > furthest) {
+                    furthest = seg.end_seconds;
+                }
+            }
+            if (furthest <= cursor + 1.0e-6) return false;
+            cursor = furthest;
+        }
+        return true;
     }
 
     void queue_job_locked(
@@ -1636,6 +1774,21 @@ public:
     double get_position_seconds() override { return transport().visible_position(); }
     bool is_position_ready(double seconds) override {
         return cache_manager().transport_position_ready(seconds);
+    }
+    bool publish_cache_block(
+        const char* track_path_utf8,
+        double start_seconds,
+        const float* original,
+        const float* vocals,
+        const float* instrumental,
+        t_size frames,
+        unsigned channels,
+        unsigned sample_rate) override {
+        return cache_manager().publish_external_segment(
+            local_path_from_utf8_cache(track_path_utf8),
+            start_seconds,
+            original, vocals, instrumental,
+            static_cast<size_t>(frames), channels, sample_rate);
     }
 };
 
