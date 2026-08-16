@@ -24,6 +24,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <stdexcept>
 #include <thread>
@@ -293,8 +294,8 @@ public:
                     return true;
                 }
 
-                for (const auto& seg :
-                     m_segments) {
+                for (const auto& seg_ptr : m_segments) {
+                const cache_segment& seg = *seg_ptr;
 
                     if (position_seconds >=
                             seg.start_seconds &&
@@ -321,8 +322,8 @@ public:
             return false;
         }
 
-        for (const auto& seg :
-             m_segments) {
+        for (const auto& seg_ptr : m_segments) {
+                const cache_segment& seg = *seg_ptr;
 
             if (position_seconds >=
                     seg.start_seconds &&
@@ -428,7 +429,7 @@ public:
 
         if (!m_segments.empty()) {
             cache_end =
-                m_segments.back().end_seconds;
+                m_segments.back()->end_seconds;
         }
 
         // No cache at all: begin at the current playback position.
@@ -499,9 +500,9 @@ public:
             // A re-analysis can republish the same tile. Replace the previous
             // external copy instead of growing the in-memory cache indefinitely.
             for (auto it = m_segments.begin(); it != m_segments.end();) {
-                if (it->external_waveform &&
-                    std::abs(it->start_seconds - start_seconds) < 0.001 &&
-                    std::abs(it->end_seconds - end_seconds) < 0.003) {
+                if ((*it)->external_waveform &&
+                    std::abs((*it)->start_seconds - start_seconds) < 0.001 &&
+                    std::abs((*it)->end_seconds - end_seconds) < 0.003) {
                     it = m_segments.erase(it);
                 } else {
                     ++it;
@@ -516,7 +517,7 @@ public:
             seg.vocals = std::move(cache_vocals);
             seg.instrumental = std::move(cache_instrumental);
             seg.external_waveform = true;
-            m_segments.push_back(std::move(seg));
+            m_segments.push_back(std::make_shared<cache_segment>(std::move(seg)));
         }
 
         m_ready_cv.notify_all();
@@ -529,7 +530,8 @@ public:
         if (position_seconds < 0.0) position_seconds = 0.0;
 
         std::lock_guard<std::mutex> lock(m_mutex);
-        for (const auto& seg : m_segments) {
+        for (const auto& seg_ptr : m_segments) {
+                const cache_segment& seg = *seg_ptr;
             if (!segment_has_mode(seg, mode)) continue;
             if (position_seconds >= seg.start_seconds &&
                 position_seconds < seg.end_seconds) {
@@ -589,7 +591,7 @@ public:
             return false;
         }
 
-        std::vector<cache_segment> snapshot;
+        std::vector<std::shared_ptr<const cache_segment>> snapshot;
 
         {
             std::lock_guard<std::mutex> lock(
@@ -599,9 +601,10 @@ public:
                 return false;
             }
 
-            snapshot.assign(
-                m_segments.begin(),
-                m_segments.end());
+            snapshot.reserve(m_segments.size());
+            for (const auto& seg : m_segments) {
+                snapshot.emplace_back(seg);
+            }
         }
 
         out.assign(
@@ -631,7 +634,8 @@ public:
             // adjacent 5-second tiles, so retain the two time-adjacent external
             // segments when both cover this sample and crossfade their handoff
             // below. This avoids both duplicate inference and hard tile seams.
-            for (const auto& seg : snapshot) {
+            for (const auto& seg_ptr : snapshot) {
+                const cache_segment& seg = *seg_ptr;
                 if (!seg.external_waveform || !segment_has_mode(seg, mode)) continue;
                 if (t < seg.start_seconds || t >= seg.end_seconds) continue;
 
@@ -644,7 +648,8 @@ public:
             }
 
             if (!first) {
-                for (const auto& seg : snapshot) {
+                for (const auto& seg_ptr : snapshot) {
+                const cache_segment& seg = *seg_ptr;
                     if (seg.external_waveform || !segment_has_mode(seg, mode)) continue;
                     if (t >= seg.start_seconds && t < seg.end_seconds) {
                         if (!first) first = &seg;
@@ -826,7 +831,8 @@ private:
         double cursor = start_seconds;
         while (cursor < end_seconds - 1.0e-6) {
             double furthest = cursor;
-            for (const auto& seg : m_segments) {
+            for (const auto& seg_ptr : m_segments) {
+                const cache_segment& seg = *seg_ptr;
                 if (!segment_has_mode(seg, mode)) continue;
                 if (seg.start_seconds <= cursor + 1.0e-6 &&
                     seg.end_seconds > furthest) {
@@ -1578,7 +1584,7 @@ private:
                                 // Completed segments remain valid for the whole track.
                                 // This also makes short reverse moves instant instead of
                                 // re-running Spleeter after every release/seek.
-                                m_segments.push_back(std::move(seg));
+                                m_segments.push_back(std::make_shared<cache_segment>(std::move(seg)));
                             }
 
                             m_job_pending =
@@ -1654,7 +1660,7 @@ private:
     bool m_job_pending = false;
 
     std::deque<cache_job> m_jobs;
-    std::deque<cache_segment> m_segments;
+    std::deque<std::shared_ptr<cache_segment>> m_segments;
 };
 
 live_cache_manager& cache_manager() {
