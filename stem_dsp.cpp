@@ -384,6 +384,22 @@ public:
         }
     }
 
+    bool transport_position_ready(double position_seconds) const {
+        const stemmode::mode mode = stemmode::get();
+        if (mode == stemmode::mode::original) return true;
+        if (position_seconds < 0.0) position_seconds = 0.0;
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& seg : m_segments) {
+            if (!segment_has_mode(seg, mode)) continue;
+            if (position_seconds >= seg.start_seconds &&
+                position_seconds < seg.end_seconds) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void request_transport(double position_seconds, bool reverse) {
         if (position_seconds < 0.0) position_seconds = 0.0;
         const stemmode::mode mode = stemmode::get();
@@ -1618,6 +1634,9 @@ public:
     void cancel_transport() override { transport().cancel(); }
     int get_state() override { return transport().state(); }
     double get_position_seconds() override { return transport().visible_position(); }
+    bool is_position_ready(double seconds) override {
+        return cache_manager().transport_position_ready(seconds);
+    }
 };
 
 static service_factory_single_t<stem_transport_service_impl>
