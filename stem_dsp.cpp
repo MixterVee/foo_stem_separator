@@ -1495,9 +1495,12 @@ private:
 
             mf_started = true;
 
-            // Engine construction itself can throw. Keeping it inside this
-            // top-level exception boundary prevents std::terminate().
-            onnxstem::engine engine;
+            // Original platter PCM does not need ONNX at all. Construct the
+            // separation engine lazily so cheap Original prefetch can begin as
+            // soon as Media Foundation is ready instead of waiting for model
+            // initialization first. Construction still stays inside the worker
+            // exception boundary and is additionally covered by the per-job try.
+            std::unique_ptr<onnxstem::engine> engine;
 
             sequential_decoder_state decoder_state;
             sequential_decoder_state preview_decoder_state;
@@ -1582,8 +1585,12 @@ private:
                                     full_window_frames * kCacheChannels, 0.0f);
                             }
 
+                            if (!engine) {
+                                engine = std::make_unique<onnxstem::engine>();
+                            }
+
                             separated =
-                                engine.process_both(
+                                engine->process_both(
                                     analysis_input.data(),
                                     analysis_input.size() / kCacheChannels,
                                     kCacheChannels,
