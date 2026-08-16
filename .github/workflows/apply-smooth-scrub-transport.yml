@@ -1,0 +1,27 @@
+name: Apply smooth scrub transport
+
+on:
+  push:
+    paths:
+      - '.github/smooth_scrub_transport_patch.py'
+      - '.github/workflows/apply-smooth-scrub-transport.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply scrub transport patch
+        run: python .github/smooth_scrub_transport_patch.py
+      - name: Commit source change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stem_dsp.cpp
+          git diff --cached --quiet && exit 0
+          git commit -m "Make platter scrubbing continuous and stop-clean"
+          git push
