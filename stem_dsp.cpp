@@ -176,8 +176,9 @@ struct cache_segment {
     double start_seconds = 0.0;
     double end_seconds = 0.0;
 
-    // Keep the decoded original beside both stems. Normal playback still uses
-    // foobar's incoming chunk; this copy is only for jog/reverse preview.
+    // Original is optional for Spectral Waveform-published blocks. Normal
+    // playback has the source chunk already, while Original transport can be
+    // decoded cheaply without invoking Spleeter.
     std::vector<float> original;
     std::vector<float> vocals;
     std::vector<float> instrumental;
@@ -471,15 +472,22 @@ public:
         std::vector<float> cache_original;
         std::vector<float> cache_vocals;
         std::vector<float> cache_instrumental;
-        if (!convert_to_cache_stereo(original, frames, channels, sample_rate, cache_original) ||
-            !convert_to_cache_stereo(vocals, frames, channels, sample_rate, cache_vocals) ||
+
+        // Spectral Waveform may omit Original for persisted transport blocks.
+        // Original is cheap to decode on demand; the separated stems are the
+        // expensive data that must survive a restart.
+        if (original != nullptr &&
+            !convert_to_cache_stereo(original, frames, channels, sample_rate, cache_original)) {
+            return false;
+        }
+        if (!convert_to_cache_stereo(vocals, frames, channels, sample_rate, cache_vocals) ||
             !convert_to_cache_stereo(instrumental, frames, channels, sample_rate, cache_instrumental)) {
             return false;
         }
-        if (cache_original.empty() || cache_vocals.size() != cache_original.size() ||
-            cache_instrumental.size() != cache_original.size()) return false;
+        if (cache_vocals.empty() || cache_instrumental.size() != cache_vocals.size()) return false;
+        if (!cache_original.empty() && cache_original.size() != cache_vocals.size()) return false;
 
-        const size_t cache_frames = cache_original.size() / kCacheChannels;
+        const size_t cache_frames = cache_vocals.size() / kCacheChannels;
         if (cache_frames == 0) return false;
         const double end_seconds = start_seconds +
             static_cast<double>(cache_frames) / static_cast<double>(kCacheRate);
