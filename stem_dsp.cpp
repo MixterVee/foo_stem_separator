@@ -67,6 +67,8 @@ constexpr double kFirstBlockFadeSeconds = 0.005;
 // mouse motion stops. Keep this slightly longer timeout as a safety net only.
 constexpr ULONGLONG kScrubAudibleSafetyMs = 320;
 constexpr double kScrubKeepaliveToleranceSeconds = 0.002;
+constexpr double kScrubSubBlockSeconds = 0.004;
+constexpr double kScrubCarrySlopeLimit = 2.0;
 
 std::wstring utf8_to_wide_cache(const char* s) {
     if (!s || !*s) return {};
@@ -2069,6 +2071,8 @@ public:
             };
 
             if (ts.state == stem_transport_hold) {
+                m_scrubRateValid = false;
+                m_scrubPreviousRate = 0.0;
                 write_silence();
                 m_position_seconds += chunk_seconds;
                 m_using_stem = false;
@@ -2084,25 +2088,107 @@ public:
                     GetTickCount64() <= ts.scrub_audible_until;
 
                 if (fresh_motion && std::abs(delta) > move_epsilon) {
-                    // Map the exact hand movement onto one output block. Positive
-                    // delta plays forward, negative delta plays backward, and the
-                    // magnitude naturally changes pitch/speed like a real platter.
                     const double output_span =
                         frames > 1
                             ? static_cast<double>(frames - 1) /
                                 static_cast<double>(rate)
                             : chunk_seconds;
-                    const double source_rate =
+                    const double target_rate =
                         output_span > 0.0 ? delta / output_span : 0.0;
 
                     cache_manager().request_transport(
-                        ts.position_seconds, source_rate < 0.0);
+                        ts.position_seconds, target_rate < 0.0);
 
-                    std::vector<float> preview;
-                    if (source_rate != 0.0 &&
-                        cache_manager().render(
-                            mode, ts.render_seconds, rate, frames, preview, source_rate) &&
-                        preview.size() == frames * kCacheChannels) {
+                    // Carry the previous block's velocity into this movement when
+                    // direction is unchanged. The Hermite slope is bounded so the
+                    // trajectory stays monotonic and can never overshoot the hand.
+                    double start_slope = 1.0;
+                    if (m_scrubRateValid && target_rate != 0.0) {
+                        if (m_scrubPreviousRate * target_rate > 0.0) {
+                            start_slope = std::clamp(
+                                m_scrubPreviousRate / target_rate,
+                                0.0, kScrubCarrySlopeLimit);
+                        } else if (m_scrubPreviousRate * target_rate < 0.0) {
+                            // A real direction reversal passes through zero rather
+                            // than leaking the old velocity into the new direction.
+                            start_slope = 0.0;
+                        }
+                    }
+
+                    auto trajectory_position = [&](size_t frame) -> double {
+                        if (frames <= 1) return ts.position_seconds;
+                        const double u =
+                            static_cast<double>(frame) /
+                            static_cast<double>(frames - 1);
+                        const double u2 = u * u;
+                        const double u3 = u2 * u;
+                        const double h10 = u3 - 2.0 * u2 + u;
+                        const double h01 = -2.0 * u3 + 3.0 * u2;
+                        const double h11 = u3 - u2;
+                        // Unit-distance Hermite curve. End slope is 1x the
+                        // block-average hand velocity; start slope carries the
+                        // previous block. start_slope<=2 with end slope 1 keeps
+                        // the curve monotonic (no hidden backwards kink).
+                        const double q =
+                            h10 * start_slope + h01 + h11;
+                        return ts.render_seconds + delta * q;
+                    };
+
+                    std::vector<float> preview(
+                        frames * kCacheChannels, 0.0f);
+                    bool rendered_all = target_rate != 0.0;
+
+                    const size_t nominal_sub_frames = (std::max)(
+                        static_cast<size_t>(2),
+                        static_cast<size_t>(std::llround(
+                            static_cast<double>(rate) * kScrubSubBlockSeconds)));
+
+                    size_t first_frame = 0;
+                    while (rendered_all && first_frame < frames) {
+                        size_t sub_frames = (std::min)(
+                            nominal_sub_frames, frames - first_frame);
+
+                        // Avoid leaving a one-frame tail when possible.
+                        if (frames - first_frame > sub_frames &&
+                            frames - first_frame - sub_frames == 1) {
+                            ++sub_frames;
+                        }
+
+                        const size_t last_frame =
+                            first_frame + sub_frames - 1;
+                        const double sub_start =
+                            trajectory_position(first_frame);
+                        const double sub_end =
+                            trajectory_position(last_frame);
+                        const double sub_span =
+                            sub_frames > 1
+                                ? static_cast<double>(sub_frames - 1) /
+                                    static_cast<double>(rate)
+                                : 0.0;
+                        const double sub_rate =
+                            sub_span > 0.0
+                                ? (sub_end - sub_start) / sub_span
+                                : target_rate;
+
+                        std::vector<float> sub_preview;
+                        if (!cache_manager().render(
+                                mode, sub_start, rate, sub_frames,
+                                sub_preview, sub_rate) ||
+                            sub_preview.size() !=
+                                sub_frames * kCacheChannels) {
+                            rendered_all = false;
+                            break;
+                        }
+
+                        std::copy(
+                            sub_preview.begin(), sub_preview.end(),
+                            preview.begin() +
+                                static_cast<std::ptrdiff_t>(
+                                    first_frame * kCacheChannels));
+                        first_frame += sub_frames;
+                    }
+
+                    if (rendered_all) {
                         write_preview(preview);
                     } else {
                         // Never play a delayed stale slice after the hand has moved
@@ -2110,10 +2196,15 @@ public:
                         write_silence();
                     }
 
-                    // Whether audible or not, consume this exact mouse movement.
-                    // A stationary target therefore has no queued audio left.
+                    m_scrubPreviousRate = target_rate;
+                    m_scrubRateValid = true;
+
+                    // Consume the exact mouse movement. The interpolation only
+                    // changes the velocity path between the same start/end samples.
                     transport().complete_scrub(ts.position_seconds);
                 } else {
+                    m_scrubRateValid = false;
+                    m_scrubPreviousRate = 0.0;
                     write_silence();
                     if (std::abs(delta) > move_epsilon) {
                         // The safety window expired before this movement could be
@@ -2127,6 +2218,8 @@ public:
             }
 
             if (ts.state == stem_transport_reverse) {
+                m_scrubRateValid = false;
+                m_scrubPreviousRate = 0.0;
                 cache_manager().request_transport(ts.render_seconds, true);
                 std::vector<float> preview;
                 if (cache_manager().render(
@@ -2144,6 +2237,8 @@ public:
             }
 
             if (ts.state == stem_transport_release_wait) {
+                m_scrubRateValid = false;
+                m_scrubPreviousRate = 0.0;
                 if (mode == stemmode::mode::original) {
                     transport().finish_release();
                     m_position_seconds += chunk_seconds;
@@ -2170,6 +2265,8 @@ public:
         }
 
         m_transportTailValid = false;
+        m_scrubRateValid = false;
+        m_scrubPreviousRate = 0.0;
 
         // V26: optional track-start pre-cache.
         //
@@ -2353,6 +2450,8 @@ public:
         m_using_stem = false;
         m_precache_handled = false;
         m_transportTailValid = false;
+        m_scrubRateValid = false;
+        m_scrubPreviousRate = 0.0;
     }
 
     double get_latency() override {
@@ -2374,6 +2473,8 @@ private:
         m_transportTailValid = false;
         m_transportTail[0] = 0;
         m_transportTail[1] = 0;
+        m_scrubRateValid = false;
+        m_scrubPreviousRate = 0.0;
     }
 
     bool m_have_position = false;
@@ -2385,6 +2486,8 @@ private:
 
     audio_sample m_transportTail[kCacheChannels] = {};
     bool m_transportTailValid = false;
+    bool m_scrubRateValid = false;
+    double m_scrubPreviousRate = 0.0;
 };
 
 static dsp_factory_t<stem_dsp>
