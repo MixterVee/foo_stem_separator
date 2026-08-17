@@ -146,6 +146,50 @@ Replace-Exact 'Gentle platter drift correction' @'
                     kScrubMaxSourceRate);
 '@
 
+Replace-Exact 'Clamp live Original range at track start' @'
+                const double need_start = (std::min)(start_seconds, last_t);
+                const double need_end = (std::max)(start_seconds, last_t);
+'@ @'
+                // The virtual stylus cannot travel before the first sample.
+                // Clamp the range test at 0 so reverse motion into the lead-in
+                // remains a valid live-PCM render rather than a cache MISS.
+                const double need_start = (std::max)(
+                    0.0, (std::min)(start_seconds, last_t));
+                const double need_end = (std::max)(
+                    0.0, (std::max)(start_seconds, last_t));
+'@
+
+Replace-Exact 'Silence negative live Original samples' @'
+                        const double t = start_seconds +
+                            source_rate * static_cast<double>(f) * dt;
+                        double source_pos =
+                            t * static_cast<double>(kCacheRate) -
+                            static_cast<double>(m_live_original_start_frame);
+'@ @'
+                        const double t = start_seconds +
+                            source_rate * static_cast<double>(f) * dt;
+                        // When a reverse gesture reaches the physical start of
+                        // the track, leave the already-zero output frame silent.
+                        // Do not repeat sample 0 as DC and do not report a MISS.
+                        if (t < 0.0) continue;
+                        double source_pos =
+                            t * static_cast<double>(kCacheRate) -
+                            static_cast<double>(m_live_original_start_frame);
+'@
+
+Replace-Exact 'Silence negative cached samples' @'
+            if (t < 0.0) {
+                g_dbg_render_misses.fetch_add(1, std::memory_order_relaxed);
+                g_dbg_last_render_source.store(stem_debug_source_miss, std::memory_order_relaxed);
+                return false;
+            }
+'@ @'
+            // Reverse motion is allowed to hit the physical start of the track.
+            // The output vector is pre-zeroed, so samples before 0:00 simply stay
+            // silent while the rest of this block continues rendering normally.
+            if (t < 0.0) continue;
+'@
+
 [System.IO.File]::WriteAllText(
     $path,
     $source,
