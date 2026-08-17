@@ -75,6 +75,10 @@ jobs:
         shell: powershell
         run: .\tools\apply_virtual_platter_patch.ps1
 
+      - name: Apply latency-aware platter reanchor patch
+        shell: powershell
+        run: .\tools\apply_latency_reanchor_patch.ps1
+
       - name: Build ONNX component
         shell: powershell
         run: |
