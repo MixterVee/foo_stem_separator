@@ -70,7 +70,13 @@ constexpr double kPrefetchSeconds = 20.0;
 // without decoding a long block first.
 constexpr double kOriginalQuickCacheSeconds = 1.5;
 constexpr double kOriginalQuickOverlapSeconds = 0.25;
-constexpr double kOriginalPrefetchSeconds = 0.50;
+// Ordinary Original decoding is cheap and must stay well ahead of a platter.
+// Keep quick random transport jobs tiny, but let the separate sequential
+// background decoder publish a much larger future window that rapid forward
+// scratches can read immediately.
+constexpr double kOriginalBackgroundCacheSeconds = 30.0;
+constexpr double kOriginalBackgroundOverlapSeconds = 3.0;
+constexpr double kOriginalBackgroundPrefetchSeconds = 12.0;
 constexpr double kSwitchFadeSeconds = 0.050;
 constexpr double kCacheHandoffFadeSeconds = 0.080;
 constexpr double kDecodeSeekPrerollSeconds = 5.0;
@@ -435,13 +441,19 @@ public:
                 // transport request made by set_hold(), leaving SCRUB with no PCM
                 // until the mouse had already moved. Re-prime a cheap decoder-only
                 // transport window here. No Spleeter inference is involved.
-                // Center a compact Original window on the grab point. It is
-                // decoder-only and is intentionally much smaller than a stem
-                // analysis block so first-motion PCM becomes available quickly.
+                // First publish a compact transport window around the grab point.
+                // Then, on the independent sequential decoder timeline, fill a
+                // large future region. Rapid scrub retargeting may coalesce the
+                // transport-preview jobs but never cancels this background job.
                 const double preview_start = (std::max)(
                     0.0, seconds - kOriginalQuickCacheSeconds * 0.5);
                 m_jobs.emplace_front(cache_job{
                     m_generation, m_path, preview_start, true, true, false});
+
+                const double background_start = (std::max)(
+                    0.0, seconds - kOriginalBackgroundOverlapSeconds);
+                m_jobs.emplace_back(cache_job{
+                    m_generation, m_path, background_start, true, false, false});
                 m_job_pending = true;
             }
         }
@@ -492,22 +504,24 @@ public:
 
             double next = 0.0;
             if (covering_end < 0.0) {
-                // A seek/jump landed outside cached Original PCM. Center a fresh
-                // quick window so both scratch directions become available fast.
+                // A seek/jump landed outside cached Original PCM. Start a large
+                // background window slightly behind the playhead so the platter
+                // immediately gains both history and substantial future material.
                 next = (std::max)(
-                    0.0, playback_seconds - kOriginalQuickCacheSeconds * 0.5);
+                    0.0, playback_seconds - kOriginalBackgroundOverlapSeconds);
             } else if (covering_end - playback_seconds <=
-                       kOriginalPrefetchSeconds) {
-                // Extend ahead with the normal overlap before the playhead reaches
-                // the current window edge.
+                       kOriginalBackgroundPrefetchSeconds) {
+                // Extend the sequential future cache long before the platter can
+                // reach its edge. This job is decoder-only and normally finishes
+                // far faster than real-time playback.
                 next = (std::max)(
-                    0.0, covering_end - kOriginalQuickOverlapSeconds);
+                    0.0, covering_end - kOriginalBackgroundOverlapSeconds);
             } else {
                 return;
             }
 
             m_jobs.emplace_back(cache_job{
-                m_generation, m_path, next, true, false, false});
+                m_generation, m_path, next, false, false, false});
             m_job_pending = true;
             m_cv.notify_one();
             return;
@@ -1716,10 +1730,14 @@ private:
 
                     const double decode_window = job.need_stems
                         ? kCacheSeconds
-                        : kOriginalQuickCacheSeconds;
+                        : (job.transport_preview
+                            ? kOriginalQuickCacheSeconds
+                            : kOriginalBackgroundCacheSeconds);
                     const double decode_overlap = job.need_stems
                         ? kCacheOverlapSeconds
-                        : kOriginalQuickOverlapSeconds;
+                        : (job.transport_preview
+                            ? kOriginalQuickOverlapSeconds
+                            : kOriginalBackgroundOverlapSeconds);
                     const double decode_preroll = job.need_stems
                         ? kDecodeSeekPrerollSeconds
                         : kOriginalDecodeSeekPrerollSeconds;
