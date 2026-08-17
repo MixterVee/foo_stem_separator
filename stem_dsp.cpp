@@ -103,6 +103,32 @@ constexpr double kScrubGestureMaxDt = 0.080;
 constexpr double kScrubMaxSourceRate = 24.0;
 constexpr double kScrubPhaseCorrectionMix = 0.22;
 
+std::atomic<uint64_t> g_dbg_render_attempts{0};
+std::atomic<uint64_t> g_dbg_render_successes{0};
+std::atomic<uint64_t> g_dbg_live_hits{0};
+std::atomic<uint64_t> g_dbg_cache_hits{0};
+std::atomic<uint64_t> g_dbg_render_misses{0};
+std::atomic<uint64_t> g_dbg_scrub_audio_writes{0};
+std::atomic<uint64_t> g_dbg_scrub_silence_writes{0};
+std::atomic<int> g_dbg_last_render_source{stem_debug_source_none};
+std::atomic<int> g_dbg_last_render_ok{0};
+std::atomic<double> g_dbg_last_render_start{0.0};
+std::atomic<double> g_dbg_last_source_rate{0.0};
+
+void reset_scratch_debug() {
+    g_dbg_render_attempts.store(0, std::memory_order_relaxed);
+    g_dbg_render_successes.store(0, std::memory_order_relaxed);
+    g_dbg_live_hits.store(0, std::memory_order_relaxed);
+    g_dbg_cache_hits.store(0, std::memory_order_relaxed);
+    g_dbg_render_misses.store(0, std::memory_order_relaxed);
+    g_dbg_scrub_audio_writes.store(0, std::memory_order_relaxed);
+    g_dbg_scrub_silence_writes.store(0, std::memory_order_relaxed);
+    g_dbg_last_render_source.store(stem_debug_source_none, std::memory_order_relaxed);
+    g_dbg_last_render_ok.store(0, std::memory_order_relaxed);
+    g_dbg_last_render_start.store(0.0, std::memory_order_relaxed);
+    g_dbg_last_source_rate.store(0.0, std::memory_order_relaxed);
+}
+
 std::wstring utf8_to_wide_cache(const char* s) {
     if (!s || !*s) return {};
 
@@ -302,6 +328,22 @@ public:
         return m_anchor_seconds;
     }
 
+    bool debug_live_range(double& start_seconds, double& end_seconds) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_live_original.empty()) {
+            start_seconds = -1.0;
+            end_seconds = -1.0;
+            return false;
+        }
+        const uint64_t frames = static_cast<uint64_t>(
+            m_live_original.size() / kCacheChannels);
+        start_seconds = static_cast<double>(m_live_original_start_frame) /
+            static_cast<double>(kCacheRate);
+        end_seconds = start_seconds + static_cast<double>(frames) /
+            static_cast<double>(kCacheRate);
+        return true;
+    }
+
     bool is_track_start_generation(
         uint64_t generation) const {
 
@@ -377,6 +419,8 @@ public:
 
     void new_track(
         const std::wstring& path) {
+
+        reset_scratch_debug();
 
         std::lock_guard<std::mutex> lock(
             m_mutex);
@@ -817,6 +861,12 @@ public:
             return false;
         }
 
+        g_dbg_render_attempts.fetch_add(1, std::memory_order_relaxed);
+        g_dbg_last_render_start.store(start_seconds, std::memory_order_relaxed);
+        g_dbg_last_source_rate.store(source_rate, std::memory_order_relaxed);
+        g_dbg_last_render_source.store(stem_debug_source_none, std::memory_order_relaxed);
+        g_dbg_last_render_ok.store(0, std::memory_order_relaxed);
+
         std::vector<std::shared_ptr<const cache_segment>> snapshot;
 
         {
@@ -857,11 +907,17 @@ public:
                             out[f * kCacheChannels + ch] = a + (b - a) * frac;
                         }
                     }
+                    g_dbg_render_successes.fetch_add(1, std::memory_order_relaxed);
+                    g_dbg_live_hits.fetch_add(1, std::memory_order_relaxed);
+                    g_dbg_last_render_source.store(stem_debug_source_live, std::memory_order_relaxed);
+                    g_dbg_last_render_ok.store(1, std::memory_order_relaxed);
                     return true;
                 }
             }
 
             if (m_segments.empty()) {
+                g_dbg_render_misses.fetch_add(1, std::memory_order_relaxed);
+                g_dbg_last_render_source.store(stem_debug_source_miss, std::memory_order_relaxed);
                 return false;
             }
 
@@ -888,7 +944,11 @@ public:
                 start_seconds +
                 source_rate * static_cast<double>(f) * dt;
 
-            if (t < 0.0) return false;
+            if (t < 0.0) {
+                g_dbg_render_misses.fetch_add(1, std::memory_order_relaxed);
+                g_dbg_last_render_source.store(stem_debug_source_miss, std::memory_order_relaxed);
+                return false;
+            }
 
             const cache_segment* first = nullptr;
             const cache_segment* second = nullptr;
@@ -921,7 +981,11 @@ public:
                 }
             }
 
-            if (!first) return false;
+            if (!first) {
+                g_dbg_render_misses.fetch_add(1, std::memory_order_relaxed);
+                g_dbg_last_render_source.store(stem_debug_source_miss, std::memory_order_relaxed);
+                return false;
+            }
 
             auto sample_from =
                 [mode, t](
@@ -1078,6 +1142,10 @@ public:
             }
         }
 
+        g_dbg_render_successes.fetch_add(1, std::memory_order_relaxed);
+        g_dbg_cache_hits.fetch_add(1, std::memory_order_relaxed);
+        g_dbg_last_render_source.store(stem_debug_source_cache, std::memory_order_relaxed);
+        g_dbg_last_render_ok.store(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -2167,6 +2235,32 @@ public:
     bool is_position_ready(double seconds) override {
         return cache_manager().transport_position_ready(seconds);
     }
+    bool get_debug_status(stem_transport_debug_status& out) override {
+        try {
+            const transport_snapshot ts = transport().snapshot();
+            out = stem_transport_debug_status{};
+            out.state = ts.state;
+            out.mode = static_cast<int>(stemmode::get());
+            out.position_seconds = ts.position_seconds;
+            out.render_seconds = ts.render_seconds;
+            out.scrub_velocity = ts.scrub_velocity;
+            out.last_render_source = g_dbg_last_render_source.load(std::memory_order_relaxed);
+            out.last_render_ok = g_dbg_last_render_ok.load(std::memory_order_relaxed);
+            out.last_render_start_seconds = g_dbg_last_render_start.load(std::memory_order_relaxed);
+            out.last_source_rate = g_dbg_last_source_rate.load(std::memory_order_relaxed);
+            cache_manager().debug_live_range(out.live_start_seconds, out.live_end_seconds);
+            out.render_attempts = g_dbg_render_attempts.load(std::memory_order_relaxed);
+            out.render_successes = g_dbg_render_successes.load(std::memory_order_relaxed);
+            out.live_hits = g_dbg_live_hits.load(std::memory_order_relaxed);
+            out.cache_hits = g_dbg_cache_hits.load(std::memory_order_relaxed);
+            out.render_misses = g_dbg_render_misses.load(std::memory_order_relaxed);
+            out.scrub_audio_writes = g_dbg_scrub_audio_writes.load(std::memory_order_relaxed);
+            out.scrub_silence_writes = g_dbg_scrub_silence_writes.load(std::memory_order_relaxed);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
     bool publish_cache_block(
         const char* track_path_utf8,
         double start_seconds,
@@ -2371,6 +2465,9 @@ public:
                 static_cast<double>(frames) / static_cast<double>(rate);
 
             auto write_silence = [&]() {
+                if (ts.state == stem_transport_scrub) {
+                    g_dbg_scrub_silence_writes.fetch_add(1, std::memory_order_relaxed);
+                }
                 std::vector<audio_sample> zeros(frames * kCacheChannels, 0);
 
                 if (m_transportTailValid && frames != 0) {
@@ -2397,6 +2494,9 @@ public:
             };
 
             auto write_preview = [&](const std::vector<float>& rendered) {
+                if (ts.state == stem_transport_scrub) {
+                    g_dbg_scrub_audio_writes.fetch_add(1, std::memory_order_relaxed);
+                }
                 std::vector<audio_sample> output(rendered.size());
                 for (size_t i = 0; i < rendered.size(); ++i) {
                     output[i] = static_cast<audio_sample>(rendered[i]);
