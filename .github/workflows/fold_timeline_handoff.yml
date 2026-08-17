@@ -20,26 +20,11 @@ jobs:
         shell: powershell
         run: .\tools\apply_stem_timeline_handoff_patch.ps1
 
-      - name: Commit clean permanent source
+      - name: Commit permanent source
         shell: powershell
         run: |
-          $workflow = '.github/workflows/build.yml'
-          $text = [System.IO.File]::ReadAllText($workflow)
-          $text = $text -replace "`r`n", "`n"
-          $block = "      - name: Apply stem timeline handoff patch`n        shell: powershell`n        run: .\tools\apply_stem_timeline_handoff_patch.ps1`n`n"
-          if (-not $text.Contains($block)) {
-            throw 'Expected timeline patch step was not found in build.yml'
-          }
-          $text = $text.Replace($block, '')
-          [System.IO.File]::WriteAllText(
-            $workflow,
-            $text,
-            [System.Text.UTF8Encoding]::new($false))
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm tools/apply_stem_timeline_handoff_patch.ps1
-          git rm .github/workflows/fold_timeline_handoff.yml
-          git add stem_dsp.cpp .github/workflows/build.yml
+          git add stem_dsp.cpp
           git commit -m "Make stem timeline handoff fix permanent"
           git push origin HEAD:main
