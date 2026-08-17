@@ -24,47 +24,11 @@ jobs:
           .\tools\apply_latency_reanchor_patch.ps1
           .\tools\apply_fast_stem_start_patch.ps1
 
-      - name: Remove temporary patch scaffolding
-        shell: powershell
-        run: |
-          $workflow = '.github/workflows/build.yml'
-          $text = [System.IO.File]::ReadAllText($workflow) -replace "`r`n", "`n"
-          $blocks = @(
-@'
-      - name: Apply xwax-style virtual platter patch
-        shell: powershell
-        run: .\tools\apply_virtual_platter_patch.ps1
-
-'@,
-@'
-      - name: Apply latency-aware platter reanchor patch
-        shell: powershell
-        run: .\tools\apply_latency_reanchor_patch.ps1
-
-'@,
-@'
-      - name: Apply proactive fast stem-start patch
-        shell: powershell
-        run: .\tools\apply_fast_stem_start_patch.ps1
-
-'@
-          )
-          foreach ($block in $blocks) {
-            if (-not $text.Contains($block)) { throw "Expected build patch step not found." }
-            $text = $text.Replace($block, '')
-          }
-          [System.IO.File]::WriteAllText($workflow, $text, [System.Text.UTF8Encoding]::new($false))
-
-          Remove-Item tools\apply_virtual_platter_patch.ps1 -Force
-          Remove-Item tools\apply_latency_reanchor_patch.ps1 -Force
-          Remove-Item tools\apply_fast_stem_start_patch.ps1 -Force
-          Remove-Item .github\workflows\fold-tested-patches.yml -Force
-
-      - name: Commit clean source baseline
+      - name: Commit transformed source
         shell: powershell
         run: |
           git config user.name "MixterVee"
           git config user.email "mixtervandal@gmail.com"
-          git add stem_dsp.cpp .github/workflows/build.yml tools .github/workflows/fold-tested-patches.yml
-          git commit -m "Make tested Stem baseline permanent"
+          git add stem_dsp.cpp
+          git commit -m "Make tested Stem source permanent"
           git push origin HEAD:main
