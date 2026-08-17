@@ -114,6 +114,17 @@ constexpr double kScrubTrajectoryHistorySeconds = 0.750;
 constexpr double kScrubRateRampSeconds = 0.006;
 constexpr double kScrubMaxCursorErrorSeconds = 0.060;
 constexpr double kScrubReversalReanchorErrorSeconds = 0.015;
+// DJ-engine scratch controller. Mixxx drives its audio scaler from a filtered
+// signed rate derived from platter target error; xwax likewise keeps a
+// continuous stylus position and only uses absolute position as drift
+// correction. Keep those responsibilities in the realtime renderer instead of
+// replaying wall-clock mouse trajectory slices as miniature seeks.
+constexpr double kDjScratchPhaseCorrectionSeconds = 0.050;
+constexpr double kDjScratchMaxCorrectionRate = 6.0;
+constexpr double kDjScratchRateFilter = 0.40;
+constexpr double kDjScratchStrongDecel = 0.10;
+constexpr double kDjScratchMotionGraceSeconds = 0.050;
+constexpr double kDjScratchStoppedRate = 0.010;
 
 std::atomic<uint64_t> g_dbg_render_attempts{0};
 std::atomic<uint64_t> g_dbg_render_successes{0};
@@ -187,6 +198,21 @@ std::wstring local_path_from_utf8_cache(const char* raw) {
     const std::wstring prefix = L"file://";
     if (path.rfind(prefix, 0) == 0) path.erase(0, prefix.size());
     return path;
+}
+
+inline float scratch_hermite4(
+    float frac,
+    float xm1,
+    float x0,
+    float x1,
+    float x2) {
+
+    const float c = (x1 - xm1) * 0.5f;
+    const float v = x0 - x1;
+    const float w = c + v;
+    const float a = w + v + (x2 - x0) * 0.5f;
+    const float b_neg = w + a;
+    return (((a * frac - b_neg) * frac + c) * frac + x0);
 }
 
 bool convert_to_cache_stereo(
@@ -897,8 +923,9 @@ public:
                 const double need_start = (std::min)(start_seconds, last_t);
                 const double need_end = (std::max)(start_seconds, last_t);
 
-                if (need_start >= live_start - 1.0e-9 &&
-                    need_end < live_end && live_frames != 0) {
+                const double live_edge = 1.0 / static_cast<double>(kCacheRate);
+                if (need_start >= live_start - live_edge &&
+                    need_end <= live_end + live_edge && live_frames != 0) {
                     out.assign(frames * kCacheChannels, 0.0f);
                     const double dt = 1.0 / static_cast<double>(output_rate);
                     for (size_t f = 0; f < frames; ++f) {
@@ -907,16 +934,21 @@ public:
                         double source_pos =
                             t * static_cast<double>(kCacheRate) -
                             static_cast<double>(m_live_original_start_frame);
-                        if (source_pos < 0.0) source_pos = 0.0;
-                        size_t i0 = static_cast<size_t>(source_pos);
-                        if (i0 >= live_frames) i0 = live_frames - 1;
+                        source_pos = std::clamp(
+                            source_pos, 0.0, static_cast<double>(live_frames - 1));
+                        const size_t i0 = static_cast<size_t>(std::floor(source_pos));
+                        const size_t im1 = i0 > 0 ? i0 - 1 : 0;
                         const size_t i1 = (std::min)(i0 + 1, live_frames - 1);
+                        const size_t i2 = (std::min)(i0 + 2, live_frames - 1);
                         const float frac = static_cast<float>(
                             source_pos - static_cast<double>(i0));
                         for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
-                            const float a = m_live_original[i0 * kCacheChannels + ch];
-                            const float b = m_live_original[i1 * kCacheChannels + ch];
-                            out[f * kCacheChannels + ch] = a + (b - a) * frac;
+                            out[f * kCacheChannels + ch] = scratch_hermite4(
+                                frac,
+                                m_live_original[im1 * kCacheChannels + ch],
+                                m_live_original[i0 * kCacheChannels + ch],
+                                m_live_original[i1 * kCacheChannels + ch],
+                                m_live_original[i2 * kCacheChannels + ch]);
                         }
                     }
                     g_dbg_render_successes.fetch_add(1, std::memory_order_relaxed);
@@ -1031,39 +1063,23 @@ public:
                     return 0.0f;
                 }
 
-                size_t i0 =
-                    static_cast<size_t>(
-                        source_pos);
+                source_pos = std::clamp(
+                    source_pos, 0.0, static_cast<double>(total_frames - 1));
 
-                if (i0 >=
-                    total_frames - 1) {
+                const size_t i0 =
+                    static_cast<size_t>(std::floor(source_pos));
+                const size_t im1 = i0 > 0 ? i0 - 1 : 0;
+                const size_t i1 = (std::min)(i0 + 1, total_frames - 1);
+                const size_t i2 = (std::min)(i0 + 2, total_frames - 1);
+                const float frac = static_cast<float>(
+                    source_pos - static_cast<double>(i0));
 
-                    i0 =
-                        total_frames - 1;
-
-                    return data[
-                        i0 * kCacheChannels +
-                        ch];
-                }
-
-                const size_t i1 =
-                    i0 + 1;
-
-                const float frac =
-                    static_cast<float>(
-                        source_pos -
-                        static_cast<double>(
-                            i0));
-
-                return
-                    data[
-                        i0 * kCacheChannels +
-                        ch] *
-                        (1.0f - frac) +
-                    data[
-                        i1 * kCacheChannels +
-                        ch] *
-                        frac;
+                return scratch_hermite4(
+                    frac,
+                    data[im1 * kCacheChannels + ch],
+                    data[i0 * kCacheChannels + ch],
+                    data[i1 * kCacheChannels + ch],
+                    data[i2 * kCacheChannels + ch]);
             };
 
             for (unsigned ch = 0;
@@ -1170,6 +1186,25 @@ private:
 
     bool range_ready_locked(stemmode::mode mode, double start_seconds, double end_seconds) const {
         if (end_seconds <= start_seconds + 1.0e-6) return true;
+
+        // The live Original deque is already resident PCM. Do not launch a
+        // random Media Foundation preview job when the platter's requested
+        // directional margin is already inside that RAM region. One cache frame
+        // of edge tolerance lets a reverse grab begin on the newest decoded
+        // sample rather than reporting a false miss at the live boundary.
+        if (mode == stemmode::mode::original && !m_live_original.empty()) {
+            const double live_start =
+                static_cast<double>(m_live_original_start_frame) /
+                static_cast<double>(kCacheRate);
+            const double live_end = live_start +
+                static_cast<double>(m_live_original.size() / kCacheChannels) /
+                static_cast<double>(kCacheRate);
+            const double edge = 1.0 / static_cast<double>(kCacheRate);
+            if (start_seconds >= live_start - edge &&
+                end_seconds <= live_end + edge) {
+                return true;
+            }
+        }
 
         double cursor = start_seconds;
         while (cursor < end_seconds - 1.0e-6) {
@@ -2556,272 +2591,167 @@ public:
 
             auto write_silence = [&]() {
                 if (ts.state == stem_transport_scrub) {
-                    g_dbg_scrub_silence_writes.fetch_add(1, std::memory_order_relaxed);
-                }
-                std::vector<audio_sample> zeros(frames * kCacheChannels, 0);
-
-                if (m_transportTailValid && frames != 0) {
-                    const size_t fade_frames = (std::min)(
-                        frames,
-                        (std::max)(static_cast<size_t>(1),
-                            static_cast<size_t>(static_cast<double>(rate) * 0.0025)));
-
-                    for (size_t f = 0; f < fade_frames; ++f) {
-                        const double gain =
-                            1.0 - static_cast<double>(f + 1) /
-                                static_cast<double>(fade_frames);
-                        for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
-                            zeros[f * kCacheChannels + ch] =
-                                static_cast<audio_sample>(
-                                    static_cast<double>(m_transportTail[ch]) * gain);
-                        }
-                    }
-                    m_transportTailValid = false;
+                // DJ-style platter engine: the hand supplies a target position and
+                // velocity, while the audio thread owns one continuous virtual
+                // stylus. This is the same separation used by mature DJ engines:
+                // controller updates never become decoder seeks or standalone
+                // chunks of mouse trajectory.
+                if (!m_scrubRateValid) {
+                    m_scrubRenderPosition = (std::max)(0.0, ts.render_seconds);
+                    m_scrubPreviousRate = 0.0;
+                    m_scrubRateValid = true;
                 }
 
-                chunk->set_data(
-                    zeros.data(), frames, channels, rate, chunk->get_channel_config());
-            };
+                const ULONGLONG now = GetTickCount64();
+                const double motion_age = ts.scrub_motion_tick == 0
+                    ? 999.0
+                    : static_cast<double>(now - ts.scrub_motion_tick) / 1000.0;
 
-            auto write_preview = [&](const std::vector<float>& rendered) {
-                if (ts.state == stem_transport_scrub) {
-                    g_dbg_scrub_audio_writes.fetch_add(1, std::memory_order_relaxed);
-                }
-                std::vector<audio_sample> output(rendered.size());
-                for (size_t i = 0; i < rendered.size(); ++i) {
-                    output[i] = static_cast<audio_sample>(rendered[i]);
-                }
+                double hand_rate = motion_age <= kDjScratchMotionGraceSeconds
+                    ? ts.scrub_velocity
+                    : 0.0;
+                hand_rate = std::clamp(
+                    hand_rate, -kScrubMaxSourceRate, kScrubMaxSourceRate);
 
-                if (m_transportTailValid && frames != 0) {
-                    const size_t blend_frames = (std::min)(
-                        frames,
-                        (std::max)(static_cast<size_t>(1),
-                            static_cast<size_t>(static_cast<double>(rate) * 0.0010)));
-                    for (size_t f = 0; f < blend_frames; ++f) {
-                        const double alpha =
-                            static_cast<double>(f + 1) /
-                            static_cast<double>(blend_frames);
-                        for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
-                            const size_t i = f * kCacheChannels + ch;
-                            output[i] = static_cast<audio_sample>(
-                                static_cast<double>(m_transportTail[ch]) * (1.0 - alpha) +
-                                static_cast<double>(output[i]) * alpha);
-                        }
-                    }
-                }
-
-                chunk->set_data(
-                    output.data(), frames, channels, rate, chunk->get_channel_config());
-
-                if (frames != 0) {
-                    const size_t last = (frames - 1) * kCacheChannels;
-                    for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
-                        m_transportTail[ch] = output[last + ch];
-                    }
-                    m_transportTailValid = true;
-                }
-            };
-
-            if (ts.state == stem_transport_hold) {
-                m_scrubRateValid = false;
-                m_scrubPreviousRate = 0.0;
-                write_silence();
-                m_position_seconds += chunk_seconds;
-                m_using_stem = false;
-                return true;
-            }
-
-            if (ts.state == stem_transport_scrub) {
-                const double move_epsilon =
+                double error = ts.position_seconds - m_scrubRenderPosition;
+                const double half_sample =
                     0.5 / static_cast<double>(rate);
 
-                std::vector<scrub_motion_event> motion;
-                const bool have_history =
-                    transport().snapshot_scrub_motion(motion);
-
-                if (have_history && !motion.empty()) {
-                    using scrub_clock = std::chrono::steady_clock;
-                    const auto now_clock = scrub_clock::now();
-                    const auto lag = std::chrono::duration_cast<scrub_clock::duration>(
-                        std::chrono::duration<double>(kScrubTrajectoryLagSeconds));
-                    const auto window_end = now_clock - lag;
-                    const auto window_start = window_end -
-                        std::chrono::duration_cast<scrub_clock::duration>(
-                            std::chrono::duration<double>(chunk_seconds));
-
-                    auto position_at = [&](scrub_clock::time_point when,
-                                           double& position,
-                                           bool& moving) {
-                        moving = false;
-                        if (motion.empty()) {
-                            position = ts.position_seconds;
-                            return;
-                        }
-
-                        if (when <= motion.front().when) {
-                            position = motion.front().position_seconds;
-                            return;
-                        }
-
-                        for (size_t i = 1; i < motion.size(); ++i) {
-                            if (when <= motion[i].when) {
-                                const auto& a = motion[i - 1];
-                                const auto& b = motion[i];
-                                const double dt = std::chrono::duration<double>(
-                                    b.when - a.when).count();
-                                if (dt <= 1.0e-9) {
-                                    position = b.position_seconds;
-                                    moving = std::abs(
-                                        b.position_seconds - a.position_seconds) >
-                                        move_epsilon;
-                                    return;
-                                }
-                                const double elapsed = std::chrono::duration<double>(
-                                    when - a.when).count();
-                                const double alpha = std::clamp(
-                                    elapsed / dt, 0.0, 1.0);
-                                position =
-                                    a.position_seconds +
-                                    (b.position_seconds - a.position_seconds) * alpha;
-                                moving = std::abs(
-                                    b.position_seconds - a.position_seconds) >
-                                    move_epsilon;
-                                return;
-                            }
-                        }
-
-                        const auto& last = motion.back();
-                        position = last.position_seconds;
-                        const double age = std::chrono::duration<double>(
-                            when - last.when).count();
-                        if (age <= 0.0 ||
-                            age > kScrubTrajectoryExtrapolateSeconds ||
-                            motion.size() < 2) {
-                            return;
-                        }
-
-                        // Estimate the newest speed over at least ~8 ms whenever
-                        // possible. This avoids treating a single 1 ms mouse packet
-                        // as a 20x-24x platter impulse.
-                        size_t prev = motion.size() - 2;
-                        while (prev > 0) {
-                            const double span = std::chrono::duration<double>(
-                                last.when - motion[prev].when).count();
-                            if (span >= kScrubTrajectorySliceSeconds) break;
-                            --prev;
-                        }
-                        const double dt = std::chrono::duration<double>(
-                            last.when - motion[prev].when).count();
-                        if (dt <= 1.0e-9) return;
-
-                        double velocity =
-                            (last.position_seconds -
-                             motion[prev].position_seconds) / dt;
-                        velocity = std::clamp(
-                            velocity,
-                            -kScrubMaxSourceRate,
-                            kScrubMaxSourceRate);
-                        position = (std::max)(
-                            0.0,
-                            last.position_seconds + velocity * age);
-                        moving = std::abs(velocity) > 1.0e-4;
-                    };
-
-                    std::vector<float> preview(
-                        frames * kCacheChannels, 0.0f);
-                    const size_t slice_frames = (std::max)(
-                        static_cast<size_t>(1),
-                        static_cast<size_t>(std::llround(
-                            kScrubTrajectorySliceSeconds *
-                            static_cast<double>(rate))));
-
-                    bool any_audio = false;
-                    double newest_rate = 0.0;
-                    double final_position = ts.position_seconds;
-                    size_t rendered_frames = 0;
-
-                    while (rendered_frames < frames) {
-                        const size_t count = (std::min)(
-                            slice_frames, frames - rendered_frames);
-                        const double slice_seconds =
-                            static_cast<double>(count) /
-                            static_cast<double>(rate);
-
-                        const auto t0 = window_start +
-                            std::chrono::duration_cast<scrub_clock::duration>(
-                                std::chrono::duration<double>(
-                                    static_cast<double>(rendered_frames) /
-                                    static_cast<double>(rate)));
-                        const auto t1 = t0 +
-                            std::chrono::duration_cast<scrub_clock::duration>(
-                                std::chrono::duration<double>(slice_seconds));
-
-                        double p0 = ts.position_seconds;
-                        double p1 = ts.position_seconds;
-                        bool moving0 = false;
-                        bool moving1 = false;
-                        position_at(t0, p0, moving0);
-                        position_at(t1, p1, moving1);
-                        p0 = (std::max)(0.0, p0);
-                        p1 = (std::max)(0.0, p1);
-                        final_position = p1;
-
-                        const double delta = p1 - p0;
-                        double local_rate =
-                            slice_seconds > 0.0 ? delta / slice_seconds : 0.0;
-
-                        // The 8 ms wall-clock slice itself is the jitter filter.
-                        // Keep only a very high safety clamp; ordinary scratching
-                        // should no longer hit it just because two mouse messages
-                        // happened 1 ms apart.
-                        local_rate = std::clamp(
-                            local_rate,
-                            -kScrubMaxSourceRate,
-                            kScrubMaxSourceRate);
-
-                        if ((moving0 || moving1) &&
-                            std::abs(local_rate) > 1.0e-4 &&
-                            std::abs(delta) > move_epsilon) {
-                            cache_manager().request_transport(
-                                p0, local_rate < 0.0);
-
-                            std::vector<float> part;
-                            if (cache_manager().render(
-                                    mode, p0, rate, count,
-                                    part, local_rate) &&
-                                part.size() == count * kCacheChannels) {
-                                std::copy(
-                                    part.begin(), part.end(),
-                                    preview.begin() +
-                                        static_cast<std::ptrdiff_t>(
-                                            rendered_frames * kCacheChannels));
-                                any_audio = true;
-                                newest_rate = local_rate;
-                            }
-                        }
-
-                        rendered_frames += count;
-                    }
-
-                    if (any_audio) {
-                        write_preview(preview);
-                        g_dbg_last_source_rate.store(
-                            newest_rate, std::memory_order_relaxed);
-                    } else {
-                        write_silence();
-                    }
-
-                    // Debug/render position follows the trajectory time that was
-                    // actually synthesized, not an arbitrarily old DSP snapshot.
-                    transport().complete_scrub(final_position);
+                // Once the hand is stationary and the stylus has reached it,
+                // behave like a stopped record: no repeated sample/DC tone.
+                if (std::abs(hand_rate) <= kDjScratchStoppedRate &&
+                    std::abs(error) <= half_sample) {
+                    m_scrubRenderPosition = ts.position_seconds;
                     m_scrubPreviousRate = 0.0;
-                    m_scrubRateValid = false;
+                    transport().complete_scrub(m_scrubRenderPosition);
+                    write_silence();
+                    m_position_seconds += chunk_seconds;
+                    m_using_stem = false;
+                    return true;
+                }
+
+                // Correct target-vs-stylus phase with a bounded velocity term.
+                // The hand velocity remains primary; position is only the servo
+                // that prevents accumulated drift, rather than a seek request.
+                const double correction = std::clamp(
+                    error / kDjScratchPhaseCorrectionSeconds,
+                    -kDjScratchMaxCorrectionRate,
+                    kDjScratchMaxCorrectionRate);
+                const double requested_rate = std::clamp(
+                    hand_rate + correction,
+                    -kScrubMaxSourceRate,
+                    kScrubMaxSourceRate);
+
+                const double previous_rate = m_scrubPreviousRate;
+                const bool reversal =
+                    previous_rate * requested_rate < 0.0;
+                const bool strong_deceleration =
+                    std::abs(requested_rate) + kDjScratchStrongDecel <
+                    std::abs(previous_rate);
+
+                // Mixxx filters ordinary acceleration but deliberately lets hard
+                // deceleration through immediately so the platter does not
+                // overshoot when the hand stops. Direction changes are handled
+                // below by explicitly crossing through zero inside the buffer.
+                double next_rate = requested_rate;
+                if (!reversal && !strong_deceleration) {
+                    next_rate =
+                        previous_rate * (1.0 - kDjScratchRateFilter) +
+                        requested_rate * kDjScratchRateFilter;
+                }
+
+                next_rate = std::clamp(
+                    next_rate, -kScrubMaxSourceRate, kScrubMaxSourceRate);
+
+                cache_manager().request_transport(
+                    m_scrubRenderPosition, next_rate < 0.0);
+
+                std::vector<float> preview(
+                    frames * kCacheChannels, 0.0f);
+                const size_t slice_frames = (std::max)(
+                    static_cast<size_t>(1),
+                    static_cast<size_t>(std::llround(
+                        kScrubTrajectorySliceSeconds *
+                        static_cast<double>(rate))));
+
+                auto ramp_rate_at = [&](double x) -> double {
+                    x = std::clamp(x, 0.0, 1.0);
+                    if (reversal) {
+                        // Mixxx's linear scaler treats a sign flip specially:
+                        // old rate -> zero for the first half, then zero -> new
+                        // rate for the second half. This avoids an instantaneous
+                        // forward/reverse discontinuity.
+                        if (x < 0.5) {
+                            return previous_rate * (1.0 - 2.0 * x);
+                        }
+                        return next_rate * (2.0 * x - 1.0);
+                    }
+                    return previous_rate +
+                        (next_rate - previous_rate) * x;
+                };
+
+                bool any_audio = false;
+                size_t rendered_frames = 0;
+                double source_position = m_scrubRenderPosition;
+
+                while (rendered_frames < frames) {
+                    const size_t count = (std::min)(
+                        slice_frames, frames - rendered_frames);
+                    const double midpoint =
+                        (static_cast<double>(rendered_frames) +
+                         0.5 * static_cast<double>(count)) /
+                        static_cast<double>(frames);
+                    double local_rate = ramp_rate_at(midpoint);
+
+                    // Very close to zero, leave this slice silent just like a
+                    // stationary record. Crucially, the source cursor does not
+                    // advance while silent.
+                    if (std::abs(local_rate) > kDjScratchStoppedRate) {
+                        std::vector<float> part;
+                        if (cache_manager().render(
+                                mode,
+                                source_position,
+                                rate,
+                                count,
+                                part,
+                                local_rate) &&
+                            part.size() == count * kCacheChannels) {
+                            std::copy(
+                                part.begin(), part.end(),
+                                preview.begin() +
+                                    static_cast<std::ptrdiff_t>(
+                                        rendered_frames * kCacheChannels));
+                            source_position = (std::max)(
+                                0.0,
+                                source_position +
+                                    local_rate *
+                                    static_cast<double>(count) /
+                                    static_cast<double>(rate));
+                            any_audio = true;
+                        } else {
+                            // Do not move the stylus on a cache miss. The
+                            // producer can catch up without creating the old
+                            // silence cascade where every subsequent render was
+                            // requested from a position we never actually heard.
+                            cache_manager().request_transport(
+                                source_position, local_rate < 0.0);
+                        }
+                    }
+
+                    rendered_frames += count;
+                }
+
+                if (any_audio) {
+                    write_preview(preview);
                 } else {
                     write_silence();
-                    m_scrubPreviousRate = 0.0;
-                    m_scrubRateValid = false;
-                    transport().complete_scrub(ts.position_seconds);
                 }
+
+                m_scrubRenderPosition = source_position;
+                m_scrubPreviousRate = next_rate;
+                g_dbg_last_source_rate.store(
+                    next_rate, std::memory_order_relaxed);
+                transport().complete_scrub(m_scrubRenderPosition);
 
                 m_position_seconds += chunk_seconds;
                 m_using_stem = false;
@@ -3086,6 +3016,7 @@ private:
         m_transportTail[1] = 0;
         m_scrubRateValid = false;
         m_scrubPreviousRate = 0.0;
+        m_scrubRenderPosition = 0.0;
     }
 
     bool m_have_position = false;
@@ -3099,6 +3030,7 @@ private:
     bool m_transportTailValid = false;
     bool m_scrubRateValid = false;
     double m_scrubPreviousRate = 0.0;
+    double m_scrubRenderPosition = 0.0;
 };
 
 static dsp_factory_t<stem_dsp>
