@@ -64,12 +64,21 @@ constexpr double kPrefetchSeconds = 20.0;
 // of waiting for a transport request after the mouse is already down.
 // Original transport does not need a 20-second analysis block. Publish a
 // compact decoder-only window quickly, then keep extending it in the background.
-constexpr double kOriginalQuickCacheSeconds = 4.0;
-constexpr double kOriginalQuickOverlapSeconds = 0.75;
-constexpr double kOriginalPrefetchSeconds = 1.5;
+// Keep random Original platter requests tiny and quick. A 1.5-second window
+// exactly covers the transport renderer's current 1.25-second directional
+// safety margin plus a small overlap, so the worker publishes usable PCM
+// without decoding a long block first.
+constexpr double kOriginalQuickCacheSeconds = 1.5;
+constexpr double kOriginalQuickOverlapSeconds = 0.25;
+constexpr double kOriginalPrefetchSeconds = 0.50;
 constexpr double kSwitchFadeSeconds = 0.050;
 constexpr double kCacheHandoffFadeSeconds = 0.080;
 constexpr double kDecodeSeekPrerollSeconds = 5.0;
+// Stem analysis keeps the conservative 5-second preroll used by the stable
+// VBR path. Original scratch PCM only needs timestamp-accurate decoder output,
+// so use a short preroll to avoid decoding/discarding five seconds on every
+// random hand movement.
+constexpr double kOriginalDecodeSeekPrerollSeconds = 0.50;
 constexpr double kFirstBlockFadeSeconds = 0.005;
 // Spectral Waveform now explicitly returns scrub transport to HOLD after real
 // mouse motion stops. Keep this slightly longer timeout as a safety net only.
@@ -1040,7 +1049,8 @@ private:
     static bool reanchor_decoder(
         sequential_decoder_state& state,
         const std::wstring& path,
-        double target_seconds) {
+        double target_seconds,
+        double seek_preroll_seconds) {
 
         if (!state.valid ||
             state.path != path) {
@@ -1054,7 +1064,7 @@ private:
 
         double seek_seconds =
             target_seconds -
-            kDecodeSeekPrerollSeconds;
+            (std::max)(0.0, seek_preroll_seconds);
 
         if (seek_seconds < 0.0) {
             seek_seconds = 0.0;
@@ -1262,6 +1272,7 @@ private:
         bool force_reanchor,
         double window_seconds,
         double overlap_seconds,
+        double seek_preroll_seconds,
         std::vector<float>& audio) {
 
         if (!state.valid) {
@@ -1292,7 +1303,8 @@ private:
             if (!reanchor_decoder(
                     state,
                     state.path,
-                    requested_start_seconds)) {
+                    requested_start_seconds,
+                    seek_preroll_seconds)) {
                 return false;
             }
             reached_target = false;
@@ -1304,7 +1316,8 @@ private:
             if (!reanchor_decoder(
                     state,
                     state.path,
-                    requested_start_seconds)) {
+                    requested_start_seconds,
+                    seek_preroll_seconds)) {
                 return false;
             }
             reached_target = false;
@@ -1569,6 +1582,9 @@ private:
                     const double decode_overlap = job.need_stems
                         ? kCacheOverlapSeconds
                         : kOriginalQuickOverlapSeconds;
+                    const double decode_preroll = job.need_stems
+                        ? kDecodeSeekPrerollSeconds
+                        : kOriginalDecodeSeekPrerollSeconds;
 
                     const bool decoded =
                         decode_exact_block(
@@ -1577,6 +1593,7 @@ private:
                             job.force_reanchor,
                             decode_window,
                             decode_overlap,
+                            decode_preroll,
                             input);
 
                     std::vector<float> vocals;
