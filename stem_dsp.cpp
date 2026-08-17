@@ -2048,6 +2048,11 @@ struct transport_snapshot {
     ULONGLONG scrub_motion_tick = 0;
 };
 
+struct scrub_motion_event {
+    double position_seconds = 0.0;
+    std::chrono::steady_clock::time_point when{};
+};
+
 class transport_controller {
 public:
     void set_hold(double seconds) {
@@ -2061,6 +2066,9 @@ public:
             m_scrub_velocity = 0.0;
             m_scrub_motion_tick = GetTickCount64();
             m_scrub_motion_clock = std::chrono::steady_clock::now();
+            m_scrub_motion_events.clear();
+            m_scrub_motion_events.push_back(
+                scrub_motion_event{seconds, m_scrub_motion_clock});
         }
         cache_manager().request_transport(seconds, false);
     }
@@ -2110,6 +2118,32 @@ public:
                 m_scrub_motion_tick = now;
                 m_scrub_motion_clock = now_clock;
                 m_scrub_audible_until = now + kScrubAudibleSafetyMs;
+
+                // Preserve the real mouse trajectory instead of extrapolating one
+                // velocity across an arbitrary foobar DSP block. HOLD already seeds
+                // the queue with the grab position. For any other entry path, create
+                // a synthetic predecessor at the measured event interval.
+                if (previous_state != stem_transport_scrub &&
+                    previous_state != stem_transport_hold) {
+                    m_scrub_motion_events.clear();
+                    m_scrub_motion_events.push_back(scrub_motion_event{
+                        previous_position,
+                        now_clock - std::chrono::duration_cast<
+                            std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>(dt))});
+                }
+                if (m_scrub_motion_events.empty()) {
+                    m_scrub_motion_events.push_back(scrub_motion_event{
+                        previous_position,
+                        now_clock - std::chrono::duration_cast<
+                            std::chrono::steady_clock::duration>(
+                                std::chrono::duration<double>(dt))});
+                }
+                m_scrub_motion_events.push_back(
+                    scrub_motion_event{seconds, now_clock});
+                while (m_scrub_motion_events.size() > 96) {
+                    m_scrub_motion_events.pop_front();
+                }
             } else if (previous_state == stem_transport_scrub) {
                 // Spectral sends one unchanged SCRUB target after the hand has
                 // been motionless for its short gate. Treat that as a soft platter
@@ -2122,6 +2156,11 @@ public:
                 m_scrub_motion_tick = now;
                 m_scrub_motion_clock = now_clock;
                 m_render_seconds = seconds;
+                // Soft idle is a real stationary platter point. Drop any already
+                // obsolete path so a later DSP callback cannot replay it.
+                m_scrub_motion_events.clear();
+                m_scrub_motion_events.push_back(
+                    scrub_motion_event{seconds, now_clock});
             }
 
             m_state = stem_transport_scrub;
@@ -2145,6 +2184,7 @@ public:
             m_scrub_velocity = 0.0;
             m_scrub_motion_tick = 0;
             m_scrub_motion_clock = {};
+            m_scrub_motion_events.clear();
         }
         cache_manager().request_transport(seconds, true);
     }
@@ -2160,6 +2200,7 @@ public:
             m_scrub_velocity = 0.0;
             m_scrub_motion_tick = 0;
             m_scrub_motion_clock = {};
+            m_scrub_motion_events.clear();
         }
         cache_manager().request_transport(seconds, false);
     }
@@ -2171,6 +2212,7 @@ public:
         m_scrub_velocity = 0.0;
         m_scrub_motion_tick = 0;
         m_scrub_motion_clock = {};
+        m_scrub_motion_events.clear();
     }
 
     transport_snapshot snapshot() const {
@@ -2178,6 +2220,35 @@ public:
         return transport_snapshot{
             m_state, m_position_seconds, m_render_seconds,
             m_scrub_audible_until, m_scrub_velocity, m_scrub_motion_tick};
+    }
+
+    bool take_scrub_motion(std::vector<scrub_motion_event>& out) {
+        out.clear();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_state != stem_transport_scrub ||
+            m_scrub_motion_events.size() < 2) {
+            return false;
+        }
+
+        // Keep only recent movement. Replaying an old gesture after the audio
+        // callback was delayed is worse than dropping it; live platter response
+        // must always favor the newest hand position. Retain one predecessor so
+        // the oldest surviving segment still has a start point.
+        const auto cutoff = std::chrono::steady_clock::now() -
+            std::chrono::milliseconds(250);
+        while (m_scrub_motion_events.size() > 2 &&
+               m_scrub_motion_events[1].when < cutoff) {
+            m_scrub_motion_events.pop_front();
+        }
+
+        out.assign(
+            m_scrub_motion_events.begin(),
+            m_scrub_motion_events.end());
+
+        const scrub_motion_event last = m_scrub_motion_events.back();
+        m_scrub_motion_events.clear();
+        m_scrub_motion_events.push_back(last);
+        return out.size() >= 2;
     }
 
     double visible_position() const {
@@ -2225,6 +2296,7 @@ private:
     double m_scrub_velocity = 0.0;
     ULONGLONG m_scrub_motion_tick = 0;
     std::chrono::steady_clock::time_point m_scrub_motion_clock{};
+    std::deque<scrub_motion_event> m_scrub_motion_events;
 };
 
 transport_controller& transport() {
@@ -2551,135 +2623,170 @@ public:
             }
 
             if (ts.state == stem_transport_scrub) {
-                const double delta =
-                    ts.position_seconds - ts.render_seconds;
                 const double move_epsilon =
                     0.5 / static_cast<double>(rate);
                 const bool fresh_motion =
                     GetTickCount64() <= ts.scrub_audible_until;
 
-                if (fresh_motion &&
-                    (std::abs(delta) > move_epsilon ||
-                     std::abs(ts.scrub_velocity) > 1.0e-4)) {
-                    // Vinyl rule: pitch/speed is the hand velocity. Do not
-                    // distort pitch to chase position error. The render cursor is
-                    // allowed to trail the newest mouse target by the actual output
-                    // latency, then the soft-idle handoff re-anchors it exactly when
-                    // the hand stops.
-                    const double target_rate = std::clamp(
-                        ts.scrub_velocity,
-                        -kScrubMaxSourceRate,
-                        kScrubMaxSourceRate);
-                    const double start_rate =
-                        m_scrubRateValid ? m_scrubPreviousRate : 0.0;
-                    const bool direction_reversal =
-                        m_scrubRateValid &&
-                        target_rate * m_scrubPreviousRate < 0.0;
-                    const bool large_cursor_drift =
-                        std::abs(delta) > kScrubMaxCursorErrorSeconds;
-                    const bool reversal_cursor_drift =
-                        direction_reversal &&
-                        std::abs(delta) > kScrubReversalReanchorErrorSeconds;
+                std::vector<scrub_motion_event> motion;
+                const bool have_motion =
+                    fresh_motion && transport().take_scrub_motion(motion);
 
-                    // Keep the audible stylus attached to the hand. The previous
-                    // velocity-only build could integrate nearly a second away from
-                    // the visible mouse position; that can never resemble a record.
-                    double render_cursor =
-                        (large_cursor_drift || reversal_cursor_drift)
-                            ? ts.position_seconds
-                            : ts.render_seconds;
+                if (have_motion) {
+                    struct motion_segment {
+                        double start_seconds = 0.0;
+                        double end_seconds = 0.0;
+                        double duration_seconds = 0.0;
+                        double source_rate = 0.0;
+                        size_t output_frames = 0;
+                    };
 
-                    const double ramp_seconds = (std::min)(
-                        kScrubRateRampSeconds, chunk_seconds);
+                    std::vector<motion_segment> segments;
+                    segments.reserve(motion.size());
+                    for (size_t i = 1; i < motion.size(); ++i) {
+                        double dt = std::chrono::duration<double>(
+                            motion[i].when - motion[i - 1].when).count();
+                        dt = std::clamp(
+                            dt, kScrubGestureMinDt, kScrubGestureMaxDt);
+                        const double delta =
+                            motion[i].position_seconds -
+                            motion[i - 1].position_seconds;
+                        if (std::abs(delta) <= move_epsilon) continue;
 
-                    double predicted_move = target_rate * chunk_seconds;
-                    if (ramp_seconds > 0.0) {
-                        predicted_move =
-                            0.5 * (start_rate + target_rate) * ramp_seconds +
-                            target_rate * (chunk_seconds - ramp_seconds);
+                        const double source_rate = std::clamp(
+                            delta / dt,
+                            -kScrubMaxSourceRate,
+                            kScrubMaxSourceRate);
+                        if (std::abs(source_rate) <= 1.0e-6) continue;
+
+                        size_t count = static_cast<size_t>(std::llround(
+                            dt * static_cast<double>(rate)));
+                        count = (std::max)(static_cast<size_t>(1), count);
+                        segments.push_back(motion_segment{
+                            motion[i - 1].position_seconds,
+                            motion[i].position_seconds,
+                            dt,
+                            source_rate,
+                            count});
                     }
-                    const double desired_next_render = (std::max)(
-                        0.0, render_cursor + predicted_move);
-                    cache_manager().request_transport(
-                        desired_next_render, predicted_move < 0.0);
 
-                    std::vector<float> preview;
-                    preview.reserve(frames * kCacheChannels);
-                    bool rendered_ok = true;
-                    size_t rendered_frames = 0;
-                    const size_t subblock_frames = (std::max)(
-                        static_cast<size_t>(1),
-                        static_cast<size_t>(std::llround(
-                            kScrubSubBlockSeconds * static_cast<double>(rate))));
+                    // The output block may be shorter than the accumulated mouse
+                    // path. Drop the OLDEST movement first so what reaches the
+                    // speakers is the most recent hand motion, not stale history.
+                    size_t total_motion_frames = 0;
+                    for (const auto& seg : segments) {
+                        total_motion_frames += seg.output_frames;
+                    }
+                    size_t trim_frames =
+                        total_motion_frames > frames
+                            ? total_motion_frames - frames
+                            : 0;
 
-                    while (rendered_frames < frames) {
-                        const size_t count = (std::min)(
-                            subblock_frames, frames - rendered_frames);
-                        const double midpoint_seconds =
-                            (static_cast<double>(rendered_frames) +
-                             0.5 * static_cast<double>(count)) /
+                    std::vector<float> preview(
+                        frames * kCacheChannels, 0.0f);
+                    size_t write_frame = 0;
+                    bool any_audio = false;
+                    double newest_rate = 0.0;
+
+                    for (const auto& seg : segments) {
+                        if (write_frame >= frames) break;
+
+                        size_t skip = (std::min)(trim_frames, seg.output_frames);
+                        trim_frames -= skip;
+                        size_t count = seg.output_frames - skip;
+                        if (count == 0) continue;
+                        count = (std::min)(count, frames - write_frame);
+
+                        const double skip_seconds =
+                            static_cast<double>(skip) /
                             static_cast<double>(rate);
+                        double source_start =
+                            seg.start_seconds +
+                            seg.source_rate * skip_seconds;
+                        source_start = (std::max)(0.0, source_start);
 
-                        double local_rate = target_rate;
-                        if (ramp_seconds > 1.0e-9 &&
-                            midpoint_seconds < ramp_seconds) {
-                            const double alpha = std::clamp(
-                                midpoint_seconds / ramp_seconds, 0.0, 1.0);
-                            local_rate =
-                                start_rate + (target_rate - start_rate) * alpha;
-                        }
-
-                        const double sub_seconds =
+                        // Never extrapolate past the actual mouse endpoint. If
+                        // clamping/rounding changed the requested duration slightly,
+                        // trim this segment to the recorded hand distance.
+                        const double available_source =
+                            std::abs(seg.end_seconds - source_start);
+                        const double requested_source =
+                            std::abs(seg.source_rate) *
                             static_cast<double>(count) /
                             static_cast<double>(rate);
-
-                        // Let the rate pass continuously through zero on a
-                        // reversal. The previous explicit silent slice audibly gated
-                        // every direction change and produced a synthetic chop.
-
-                        // Do not read before 0:00 when a backward stroke reaches the
-                        // physical start of the file. Land on the edge instead.
-                        if (local_rate < 0.0 &&
-                            render_cursor + local_rate * sub_seconds < 0.0) {
-                            local_rate = -render_cursor / sub_seconds;
+                        if (requested_source > available_source + 1.0e-9) {
+                            const size_t bounded = static_cast<size_t>(std::floor(
+                                available_source * static_cast<double>(rate) /
+                                std::abs(seg.source_rate)));
+                            count = (std::min)(count, bounded);
                         }
+                        if (count == 0) continue;
+
+                        cache_manager().request_transport(
+                            source_start, seg.source_rate < 0.0);
 
                         std::vector<float> part;
                         if (!cache_manager().render(
-                                mode, render_cursor, rate, count,
-                                part, local_rate) ||
+                                mode, source_start, rate, count,
+                                part, seg.source_rate) ||
                             part.size() != count * kCacheChannels) {
-                            rendered_ok = false;
-                            break;
+                            // Keep timing intact with silence for just this segment.
+                            write_frame += count;
+                            continue;
                         }
 
-                        preview.insert(preview.end(), part.begin(), part.end());
-                        render_cursor = (std::max)(
-                            0.0, render_cursor + local_rate * sub_seconds);
-                        rendered_frames += count;
+                        std::copy(
+                            part.begin(), part.end(),
+                            preview.begin() + static_cast<std::ptrdiff_t>(
+                                write_frame * kCacheChannels));
+                        write_frame += count;
+                        any_audio = true;
+                        newest_rate = seg.source_rate;
                     }
 
-                    if (rendered_ok &&
-                        preview.size() == frames * kCacheChannels) {
+                    if (any_audio) {
+                        // Stop cleanly at the newest mouse point. A tiny amplitude
+                        // taper prevents a hard step into the stationary (silent)
+                        // part of a large foobar chunk without changing scratch pitch.
+                        if (write_frame != 0 && write_frame < frames) {
+                            const size_t fade_frames = (std::min)(
+                                write_frame,
+                                (std::max)(static_cast<size_t>(1),
+                                    static_cast<size_t>(
+                                        0.0015 * static_cast<double>(rate))));
+                            for (size_t f = 0; f < fade_frames; ++f) {
+                                const double gain =
+                                    static_cast<double>(fade_frames - f - 1) /
+                                    static_cast<double>(fade_frames);
+                                const size_t frame_index =
+                                    write_frame - fade_frames + f;
+                                for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
+                                    preview[frame_index * kCacheChannels + ch] =
+                                        static_cast<float>(
+                                            static_cast<double>(
+                                                preview[frame_index * kCacheChannels + ch]) *
+                                            gain);
+                                }
+                            }
+                        }
+
                         write_preview(preview);
-                        transport().complete_scrub(render_cursor);
-                        m_scrubPreviousRate = target_rate;
-                        m_scrubRateValid = true;
+                        g_dbg_last_source_rate.store(
+                            newest_rate, std::memory_order_relaxed);
                     } else {
-                        // Never change pitch merely to stay inside cache. A miss is
-                        // preferable to the old 75/50/25% speed fallback because
-                        // that fallback was audibly changing the scratch gesture.
                         write_silence();
-                        m_scrubPreviousRate = 0.0;
-                        m_scrubRateValid = false;
                     }
+
+                    // Position is dictated by the hand, never by integration of
+                    // output block duration. This is the core trajectory change.
+                    transport().complete_scrub(ts.position_seconds);
+                    m_scrubPreviousRate = 0.0;
+                    m_scrubRateValid = false;
                 } else {
                     write_silence();
                     m_scrubPreviousRate = 0.0;
                     m_scrubRateValid = false;
-                    if (std::abs(delta) > move_epsilon) {
-                        transport().complete_scrub(ts.position_seconds);
-                    }
+                    transport().complete_scrub(ts.position_seconds);
                 }
                 m_position_seconds += chunk_seconds;
                 m_using_stem = false;
