@@ -56,8 +56,12 @@ namespace {
 constexpr unsigned kCacheRate = 44100;
 constexpr unsigned kCacheChannels = 2;
 
-constexpr double kCacheSeconds = 20.0;
-constexpr double kCacheOverlapSeconds = 3.0;
+// Mouse scratching no longer needs long stem transport blocks. Publish small
+// live stem blocks quickly; this was the known-stable live configuration before
+// the scratch-cache experiments. Spleeter produces both stems in one pass, so
+// every completed block makes Vocals and Instrumental immediately switchable.
+constexpr double kCacheSeconds = 4.0;
+constexpr double kCacheOverlapSeconds = 1.0;
 constexpr double kPrefetchSeconds = 20.0;
 // Original PCM is cheap to decode, so keep a smaller trigger margin around the
 // playhead continuously. This makes the very first platter grab audible instead
@@ -68,8 +72,12 @@ constexpr double kPrefetchSeconds = 20.0;
 // exactly covers the transport renderer's current 1.25-second directional
 // safety margin plus a small overlap, so the worker publishes usable PCM
 // without decoding a long block first.
-constexpr double kOriginalQuickCacheSeconds = 1.5;
-constexpr double kOriginalQuickOverlapSeconds = 0.25;
+// A platter can reverse without warning, so a transport preview must cover
+// both sides of the stylus rather than only the current direction. Three
+// seconds gives the existing 1.25-second safety margin on each side plus
+// interpolation/decoder-edge headroom.
+constexpr double kOriginalQuickCacheSeconds = 3.0;
+constexpr double kOriginalQuickOverlapSeconds = 0.50;
 // Ordinary Original decoding is cheap and must stay well ahead of a platter.
 // Keep quick random transport jobs tiny, but let the separate sequential
 // background decoder publish a much larger future window that rapid forward
@@ -119,8 +127,18 @@ constexpr double kScrubReversalReanchorErrorSeconds = 0.015;
 // continuous stylus position and only uses absolute position as drift
 // correction. Keep those responsibilities in the realtime renderer instead of
 // replaying wall-clock mouse trajectory slices as miniature seeks.
-constexpr double kDjScratchPhaseCorrectionSeconds = 0.050;
-constexpr double kDjScratchMaxCorrectionRate = 6.0;
+// xwax-style virtual platter control: signed hand velocity is the primary
+// transport. Absolute position only removes small accumulated drift over a
+// relatively slow sync interval. A large hand/render delta is normal while
+// foobar has queued output and must not become a multi-x corrective speed jump.
+constexpr double kDjScratchSyncTimeSeconds = 0.500;
+constexpr double kDjScratchCorrectionWindowSeconds = 0.125;
+constexpr double kDjScratchMaxCorrectionRate = 0.35;
+// Foobar's queued output means roughly one configured output-buffer worth of
+// hand/render separation is normal. Beyond this larger guard, however, the
+// virtual stylus is genuinely stale and should re-anchor at the next DSP chunk
+// instead of remaining seconds behind a fast hand movement.
+constexpr double kDjScratchReanchorSeconds = 0.250;
 constexpr double kDjScratchRateFilter = 0.40;
 constexpr double kDjScratchStrongDecel = 0.10;
 constexpr double kDjScratchMotionGraceSeconds = 0.050;
@@ -479,12 +497,17 @@ public:
 
         if (!m_path.empty()) {
             const stemmode::mode mode = stemmode::get();
-            if (mode != stemmode::mode::original) {
+            const bool warm_stems =
+                mode != stemmode::mode::original || stem_precache::enabled();
+            if (warm_stems) {
+                // Pre-cache now means PRE-cache: start Spleeter as soon as a new
+                // track begins even while Original is selected. The generated
+                // segment contains Original + Vocals + Instrumental, so no
+                // separate Original decoder job is needed for this region.
                 queue_job_locked(0.0, true);
             } else {
-                // Pre-decode the first Original transport window immediately.
-                // Unlike stem caching this is just Media Foundation decode and is
-                // cheap enough to keep ready for platter work all the time.
+                // Pre-cache was explicitly disabled: retain the cheap Original
+                // decoder-only behavior and leave ONNX lazy.
                 m_jobs.emplace_back(cache_job{
                     m_generation, m_path, 0.0, true, false, false});
                 m_job_pending = true;
@@ -575,7 +598,14 @@ public:
     }
 
     void ensure_ahead(double playback_seconds) {
-        const stemmode::mode mode = stemmode::get();
+        const stemmode::mode selected_mode = stemmode::get();
+        // When pre-cache is enabled, keep generating stem blocks ahead even if
+        // the listener is currently hearing Original. A vocals probe is enough:
+        // each Spleeter job always publishes both Vocals and Instrumental.
+        const stemmode::mode mode =
+            selected_mode == stemmode::mode::original && stem_precache::enabled()
+                ? stemmode::mode::vocals
+                : selected_mode;
 
         std::lock_guard<std::mutex> lock(
             m_mutex);
@@ -849,15 +879,22 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_path.empty()) return;
 
-        // Require a little playable material on the side in which transport will
-        // travel. If it is already cached, no worker job is necessary.
+        // Original scratching is intrinsically bidirectional: the next mouse
+        // event may reverse instantly. Require PCM on both sides of the stylus.
+        // Separated-stem previews retain their directional policy because those
+        // jobs are much more expensive than decoder-only Original previews.
+        const bool original_preview = mode == stemmode::mode::original;
         const double margin = 1.25;
-        const double need_start = reverse
+        const double need_start = original_preview
             ? (std::max)(0.0, position_seconds - margin)
-            : position_seconds;
-        const double need_end = reverse
-            ? position_seconds
-            : position_seconds + margin;
+            : (reverse
+                ? (std::max)(0.0, position_seconds - margin)
+                : position_seconds);
+        const double need_end = original_preview
+            ? position_seconds + margin
+            : (reverse
+                ? position_seconds
+                : position_seconds + margin);
 
         if (range_ready_locked(mode, need_start, need_end)) return;
 
@@ -868,16 +905,20 @@ public:
             else ++it;
         }
 
-        const bool original_preview = mode == stemmode::mode::original;
         const double transport_window = original_preview
             ? kOriginalQuickCacheSeconds
             : kCacheSeconds;
         const double edge_preroll = original_preview ? 0.25 : 0.5;
 
-        double start = reverse
-            ? (std::max)(0.0, position_seconds -
-                (transport_window - edge_preroll))
-            : (std::max)(0.0, position_seconds - edge_preroll);
+        // Center cheap Original PCM around the stylus so a reversal never needs
+        // a decoder retarget first. Stem previews keep their old directional
+        // placement to avoid unnecessary Spleeter work.
+        double start = original_preview
+            ? (std::max)(0.0, position_seconds - transport_window * 0.5)
+            : (reverse
+                ? (std::max)(0.0, position_seconds -
+                    (transport_window - edge_preroll))
+                : (std::max)(0.0, position_seconds - edge_preroll));
 
         m_jobs.emplace_front(cache_job{
             m_generation, m_path, start, true, true,
@@ -920,8 +961,13 @@ public:
                 const double last_t = start_seconds +
                     source_rate * static_cast<double>(frames - 1) /
                     static_cast<double>(output_rate);
-                const double need_start = (std::min)(start_seconds, last_t);
-                const double need_end = (std::max)(start_seconds, last_t);
+                // The virtual stylus cannot travel before the first sample.
+                // Clamp the range test at 0 so reverse motion into the lead-in
+                // remains a valid live-PCM render rather than a cache MISS.
+                const double need_start = (std::max)(
+                    0.0, (std::min)(start_seconds, last_t));
+                const double need_end = (std::max)(
+                    0.0, (std::max)(start_seconds, last_t));
 
                 const double live_edge = 1.0 / static_cast<double>(kCacheRate);
                 if (need_start >= live_start - live_edge &&
@@ -931,6 +977,10 @@ public:
                     for (size_t f = 0; f < frames; ++f) {
                         const double t = start_seconds +
                             source_rate * static_cast<double>(f) * dt;
+                        // When a reverse gesture reaches the physical start of
+                        // the track, leave the already-zero output frame silent.
+                        // Do not repeat sample 0 as DC and do not report a MISS.
+                        if (t < 0.0) continue;
                         double source_pos =
                             t * static_cast<double>(kCacheRate) -
                             static_cast<double>(m_live_original_start_frame);
@@ -988,11 +1038,10 @@ public:
                 start_seconds +
                 source_rate * static_cast<double>(f) * dt;
 
-            if (t < 0.0) {
-                g_dbg_render_misses.fetch_add(1, std::memory_order_relaxed);
-                g_dbg_last_render_source.store(stem_debug_source_miss, std::memory_order_relaxed);
-                return false;
-            }
+            // Reverse motion is allowed to hit the physical start of the track.
+            // The output vector is pre-zeroed, so samples before 0:00 simply stay
+            // silent while the rest of this block continues rendering normally.
+            if (t < 0.0) continue;
 
             const cache_segment* first = nullptr;
             const cache_segment* second = nullptr;
@@ -1812,12 +1861,16 @@ private:
 
             mf_started = true;
 
-            // Original platter PCM does not need ONNX at all. Construct the
-            // separation engine lazily so cheap Original prefetch can begin as
-            // soon as Media Foundation is ready instead of waiting for model
-            // initialization first. Construction still stays inside the worker
-            // exception boundary and is additionally covered by the per-job try.
+            // Pre-cache is enabled by default. Warm the ONNX/Spleeter session on
+            // the cache worker immediately so the first user stem request does not
+            // also pay DLL/model/session creation. This never blocks foobar's UI or
+            // ordinary Original playback. If pre-cache is disabled, preserve lazy
+            // initialization exactly as before.
             std::unique_ptr<onnxstem::engine> engine;
+            if (stem_precache::enabled()) {
+                engine = std::make_unique<onnxstem::engine>();
+                engine->ready();
+            }
 
             sequential_decoder_state decoder_state;
             sequential_decoder_state preview_decoder_state;
@@ -2713,19 +2766,37 @@ public:
                     return true;
                 }
 
-                // Mixxx-style target servo: hand velocity is primary; bounded
-                // position error correction prevents the virtual stylus drifting
-                // away from the platter without turning that target into a seek.
-                const double correction = std::clamp(
-                    error / kDjScratchPhaseCorrectionSeconds,
-                    -kDjScratchMaxCorrectionRate,
-                    kDjScratchMaxCorrectionRate);
+                // xwax-style target correction: hand velocity drives the PCM
+                // reader. Correct only small accumulated drift, and do it slowly.
+                // A much larger error means the DSP has fallen more than the
+                // normal foobar output queue behind the controller. Re-anchor the
+                // *virtual* stylus at this chunk boundary; this is not a foobar
+                // seek and does not flush/cache-reset anything.
+                const bool hard_reanchor =
+                    std::abs(error) > kDjScratchReanchorSeconds;
+                const double render_anchor = hard_reanchor
+                    ? (std::max)(0.0, ts.position_seconds)
+                    : m_scrubRenderPosition;
+
+                double correction = 0.0;
+                if (!hard_reanchor &&
+                    std::abs(error) <=
+                        kDjScratchCorrectionWindowSeconds) {
+                    correction = std::clamp(
+                        error / kDjScratchSyncTimeSeconds,
+                        -kDjScratchMaxCorrectionRate,
+                        kDjScratchMaxCorrectionRate);
+                }
                 const double requested_rate = std::clamp(
                     hand_rate + correction,
                     -kScrubMaxSourceRate,
                     kScrubMaxSourceRate);
 
-                const double previous_rate = m_scrubPreviousRate;
+                // Do not ramp from a stale old velocity after a hard re-anchor;
+                // start this chunk at the currently measured platter rate.
+                const double previous_rate = hard_reanchor
+                    ? requested_rate
+                    : m_scrubPreviousRate;
                 const bool reversal = previous_rate * requested_rate < 0.0;
                 const bool strong_deceleration =
                     std::abs(requested_rate) + kDjScratchStrongDecel <
@@ -2744,7 +2815,7 @@ public:
                     next_rate, -kScrubMaxSourceRate, kScrubMaxSourceRate);
 
                 cache_manager().request_transport(
-                    m_scrubRenderPosition, next_rate < 0.0);
+                    render_anchor, next_rate < 0.0);
 
                 std::vector<float> preview(frames * kCacheChannels, 0.0f);
                 const size_t slice_frames = (std::max)(
@@ -2768,7 +2839,7 @@ public:
 
                 bool any_audio = false;
                 size_t rendered_frames = 0;
-                double source_position = m_scrubRenderPosition;
+                double source_position = render_anchor;
 
                 while (rendered_frames < frames) {
                     const size_t count = (std::min)(
