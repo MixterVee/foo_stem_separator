@@ -1,0 +1,25 @@
+name: Apply rolling Original platter buffer
+
+on:
+  push:
+    paths:
+      - '.github/rolling_original_buffer_patch.py'
+      - '.github/workflows/apply-rolling-original-buffer.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patch
+        run: python .github/rolling_original_buffer_patch.py
+      - name: Commit source change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stem_dsp.cpp
+          git commit -m "Keep rolling Original PCM buffer for scratching"
+          git push
