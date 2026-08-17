@@ -101,6 +101,13 @@ constexpr double kScrubGestureDefaultDt = 0.016;
 constexpr double kScrubGestureMinDt = 0.001;
 constexpr double kScrubGestureMaxDt = 0.250;
 constexpr double kScrubMaxSourceRate = 24.0;
+// Render a short, fixed-delay window of the real mouse path. This decouples
+// scratch audio from arbitrary foobar DSP block boundaries and averages away
+// 1-2 ms Windows mouse-message timing spikes without adding a perceptible delay.
+constexpr double kScrubTrajectoryLagSeconds = 0.010;
+constexpr double kScrubTrajectorySliceSeconds = 0.008;
+constexpr double kScrubTrajectoryExtrapolateSeconds = 0.012;
+constexpr double kScrubTrajectoryHistorySeconds = 0.750;
 // Pitch follows measured hand velocity. Keep only a very short audio-side ramp
 // for click-free acceleration, and sample-lock the virtual stylus whenever its
 // integrated cursor drifts materially away from the actual hand position.
@@ -2156,11 +2163,18 @@ public:
                 m_scrub_motion_tick = now;
                 m_scrub_motion_clock = now_clock;
                 m_render_seconds = seconds;
-                // Soft idle is a real stationary platter point. Drop any already
-                // obsolete path so a later DSP callback cannot replay it.
-                m_scrub_motion_events.clear();
-                m_scrub_motion_events.push_back(
-                    scrub_motion_event{seconds, now_clock});
+                // Soft idle is a real stationary platter point. Keep the recent
+                // trajectory and append a stationary endpoint; the DSP renders a
+                // fixed wall-clock window, so preserving the tail cannot replay old
+                // motion but does let the last few milliseconds drain naturally.
+                if (m_scrub_motion_events.empty() ||
+                    m_scrub_motion_events.back().when != now_clock) {
+                    m_scrub_motion_events.push_back(
+                        scrub_motion_event{seconds, now_clock});
+                }
+                while (m_scrub_motion_events.size() > 128) {
+                    m_scrub_motion_events.pop_front();
+                }
             }
 
             m_state = stem_transport_scrub;
@@ -2222,20 +2236,19 @@ public:
             m_scrub_audible_until, m_scrub_velocity, m_scrub_motion_tick};
     }
 
-    bool take_scrub_motion(std::vector<scrub_motion_event>& out) {
+    bool snapshot_scrub_motion(std::vector<scrub_motion_event>& out) {
         out.clear();
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_state != stem_transport_scrub ||
-            m_scrub_motion_events.size() < 2) {
+        if (m_state != stem_transport_scrub || m_scrub_motion_events.empty()) {
             return false;
         }
 
-        // Keep only recent movement. Replaying an old gesture after the audio
-        // callback was delayed is worse than dropping it; live platter response
-        // must always favor the newest hand position. Retain one predecessor so
-        // the oldest surviving segment still has a start point.
         const auto cutoff = std::chrono::steady_clock::now() -
-            std::chrono::milliseconds(250);
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(kScrubTrajectoryHistorySeconds));
+
+        // Retain one predecessor before the cutoff so interpolation at the start
+        // of the requested wall-clock window remains continuous.
         while (m_scrub_motion_events.size() > 2 &&
                m_scrub_motion_events[1].when < cutoff) {
             m_scrub_motion_events.pop_front();
@@ -2244,11 +2257,7 @@ public:
         out.assign(
             m_scrub_motion_events.begin(),
             m_scrub_motion_events.end());
-
-        const scrub_motion_event last = m_scrub_motion_events.back();
-        m_scrub_motion_events.clear();
-        m_scrub_motion_events.push_back(last);
-        return out.size() >= 2;
+        return !out.empty();
     }
 
     double visible_position() const {
@@ -2625,151 +2634,176 @@ public:
             if (ts.state == stem_transport_scrub) {
                 const double move_epsilon =
                     0.5 / static_cast<double>(rate);
-                const bool fresh_motion =
-                    GetTickCount64() <= ts.scrub_audible_until;
 
                 std::vector<scrub_motion_event> motion;
-                const bool have_motion =
-                    fresh_motion && transport().take_scrub_motion(motion);
+                const bool have_history =
+                    transport().snapshot_scrub_motion(motion);
 
-                if (have_motion) {
-                    struct motion_segment {
-                        double start_seconds = 0.0;
-                        double end_seconds = 0.0;
-                        double duration_seconds = 0.0;
-                        double source_rate = 0.0;
-                        size_t output_frames = 0;
-                    };
+                if (have_history && !motion.empty()) {
+                    using scrub_clock = std::chrono::steady_clock;
+                    const auto now_clock = scrub_clock::now();
+                    const auto lag = std::chrono::duration_cast<scrub_clock::duration>(
+                        std::chrono::duration<double>(kScrubTrajectoryLagSeconds));
+                    const auto window_end = now_clock - lag;
+                    const auto window_start = window_end -
+                        std::chrono::duration_cast<scrub_clock::duration>(
+                            std::chrono::duration<double>(chunk_seconds));
 
-                    std::vector<motion_segment> segments;
-                    segments.reserve(motion.size());
-                    for (size_t i = 1; i < motion.size(); ++i) {
-                        double dt = std::chrono::duration<double>(
-                            motion[i].when - motion[i - 1].when).count();
-                        dt = std::clamp(
-                            dt, kScrubGestureMinDt, kScrubGestureMaxDt);
-                        const double delta =
-                            motion[i].position_seconds -
-                            motion[i - 1].position_seconds;
-                        if (std::abs(delta) <= move_epsilon) continue;
-
-                        const double source_rate = std::clamp(
-                            delta / dt,
-                            -kScrubMaxSourceRate,
-                            kScrubMaxSourceRate);
-                        if (std::abs(source_rate) <= 1.0e-6) continue;
-
-                        size_t count = static_cast<size_t>(std::llround(
-                            dt * static_cast<double>(rate)));
-                        count = (std::max)(static_cast<size_t>(1), count);
-                        segments.push_back(motion_segment{
-                            motion[i - 1].position_seconds,
-                            motion[i].position_seconds,
-                            dt,
-                            source_rate,
-                            count});
-                    }
-
-                    // The output block may be shorter than the accumulated mouse
-                    // path. Drop the OLDEST movement first so what reaches the
-                    // speakers is the most recent hand motion, not stale history.
-                    size_t total_motion_frames = 0;
-                    for (const auto& seg : segments) {
-                        total_motion_frames += seg.output_frames;
-                    }
-                    size_t trim_frames =
-                        total_motion_frames > frames
-                            ? total_motion_frames - frames
-                            : 0;
-
-                    std::vector<float> preview(
-                        frames * kCacheChannels, 0.0f);
-                    size_t write_frame = 0;
-                    bool any_audio = false;
-                    double newest_rate = 0.0;
-
-                    for (const auto& seg : segments) {
-                        if (write_frame >= frames) break;
-
-                        size_t skip = (std::min)(trim_frames, seg.output_frames);
-                        trim_frames -= skip;
-                        size_t count = seg.output_frames - skip;
-                        if (count == 0) continue;
-                        count = (std::min)(count, frames - write_frame);
-
-                        const double skip_seconds =
-                            static_cast<double>(skip) /
-                            static_cast<double>(rate);
-                        double source_start =
-                            seg.start_seconds +
-                            seg.source_rate * skip_seconds;
-                        source_start = (std::max)(0.0, source_start);
-
-                        // Never extrapolate past the actual mouse endpoint. If
-                        // clamping/rounding changed the requested duration slightly,
-                        // trim this segment to the recorded hand distance.
-                        const double available_source =
-                            std::abs(seg.end_seconds - source_start);
-                        const double requested_source =
-                            std::abs(seg.source_rate) *
-                            static_cast<double>(count) /
-                            static_cast<double>(rate);
-                        if (requested_source > available_source + 1.0e-9) {
-                            const size_t bounded = static_cast<size_t>(std::floor(
-                                available_source * static_cast<double>(rate) /
-                                std::abs(seg.source_rate)));
-                            count = (std::min)(count, bounded);
-                        }
-                        if (count == 0) continue;
-
-                        cache_manager().request_transport(
-                            source_start, seg.source_rate < 0.0);
-
-                        std::vector<float> part;
-                        if (!cache_manager().render(
-                                mode, source_start, rate, count,
-                                part, seg.source_rate) ||
-                            part.size() != count * kCacheChannels) {
-                            // Keep timing intact with silence for just this segment.
-                            write_frame += count;
-                            continue;
+                    auto position_at = [&](scrub_clock::time_point when,
+                                           double& position,
+                                           bool& moving) {
+                        moving = false;
+                        if (motion.empty()) {
+                            position = ts.position_seconds;
+                            return;
                         }
 
-                        std::copy(
-                            part.begin(), part.end(),
-                            preview.begin() + static_cast<std::ptrdiff_t>(
-                                write_frame * kCacheChannels));
-                        write_frame += count;
-                        any_audio = true;
-                        newest_rate = seg.source_rate;
-                    }
+                        if (when <= motion.front().when) {
+                            position = motion.front().position_seconds;
+                            return;
+                        }
 
-                    if (any_audio) {
-                        // Stop cleanly at the newest mouse point. A tiny amplitude
-                        // taper prevents a hard step into the stationary (silent)
-                        // part of a large foobar chunk without changing scratch pitch.
-                        if (write_frame != 0 && write_frame < frames) {
-                            const size_t fade_frames = (std::min)(
-                                write_frame,
-                                (std::max)(static_cast<size_t>(1),
-                                    static_cast<size_t>(
-                                        0.0015 * static_cast<double>(rate))));
-                            for (size_t f = 0; f < fade_frames; ++f) {
-                                const double gain =
-                                    static_cast<double>(fade_frames - f - 1) /
-                                    static_cast<double>(fade_frames);
-                                const size_t frame_index =
-                                    write_frame - fade_frames + f;
-                                for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
-                                    preview[frame_index * kCacheChannels + ch] =
-                                        static_cast<float>(
-                                            static_cast<double>(
-                                                preview[frame_index * kCacheChannels + ch]) *
-                                            gain);
+                        for (size_t i = 1; i < motion.size(); ++i) {
+                            if (when <= motion[i].when) {
+                                const auto& a = motion[i - 1];
+                                const auto& b = motion[i];
+                                const double dt = std::chrono::duration<double>(
+                                    b.when - a.when).count();
+                                if (dt <= 1.0e-9) {
+                                    position = b.position_seconds;
+                                    moving = std::abs(
+                                        b.position_seconds - a.position_seconds) >
+                                        move_epsilon;
+                                    return;
                                 }
+                                const double elapsed = std::chrono::duration<double>(
+                                    when - a.when).count();
+                                const double alpha = std::clamp(
+                                    elapsed / dt, 0.0, 1.0);
+                                position =
+                                    a.position_seconds +
+                                    (b.position_seconds - a.position_seconds) * alpha;
+                                moving = std::abs(
+                                    b.position_seconds - a.position_seconds) >
+                                    move_epsilon;
+                                return;
                             }
                         }
 
+                        const auto& last = motion.back();
+                        position = last.position_seconds;
+                        const double age = std::chrono::duration<double>(
+                            when - last.when).count();
+                        if (age <= 0.0 ||
+                            age > kScrubTrajectoryExtrapolateSeconds ||
+                            motion.size() < 2) {
+                            return;
+                        }
+
+                        // Estimate the newest speed over at least ~8 ms whenever
+                        // possible. This avoids treating a single 1 ms mouse packet
+                        // as a 20x-24x platter impulse.
+                        size_t prev = motion.size() - 2;
+                        while (prev > 0) {
+                            const double span = std::chrono::duration<double>(
+                                last.when - motion[prev].when).count();
+                            if (span >= kScrubTrajectorySliceSeconds) break;
+                            --prev;
+                        }
+                        const double dt = std::chrono::duration<double>(
+                            last.when - motion[prev].when).count();
+                        if (dt <= 1.0e-9) return;
+
+                        double velocity =
+                            (last.position_seconds -
+                             motion[prev].position_seconds) / dt;
+                        velocity = std::clamp(
+                            velocity,
+                            -kScrubMaxSourceRate,
+                            kScrubMaxSourceRate);
+                        position = (std::max)(
+                            0.0,
+                            last.position_seconds + velocity * age);
+                        moving = std::abs(velocity) > 1.0e-4;
+                    };
+
+                    std::vector<float> preview(
+                        frames * kCacheChannels, 0.0f);
+                    const size_t slice_frames = (std::max)(
+                        static_cast<size_t>(1),
+                        static_cast<size_t>(std::llround(
+                            kScrubTrajectorySliceSeconds *
+                            static_cast<double>(rate))));
+
+                    bool any_audio = false;
+                    double newest_rate = 0.0;
+                    double final_position = ts.position_seconds;
+                    size_t rendered_frames = 0;
+
+                    while (rendered_frames < frames) {
+                        const size_t count = (std::min)(
+                            slice_frames, frames - rendered_frames);
+                        const double slice_seconds =
+                            static_cast<double>(count) /
+                            static_cast<double>(rate);
+
+                        const auto t0 = window_start +
+                            std::chrono::duration_cast<scrub_clock::duration>(
+                                std::chrono::duration<double>(
+                                    static_cast<double>(rendered_frames) /
+                                    static_cast<double>(rate)));
+                        const auto t1 = t0 +
+                            std::chrono::duration_cast<scrub_clock::duration>(
+                                std::chrono::duration<double>(slice_seconds));
+
+                        double p0 = ts.position_seconds;
+                        double p1 = ts.position_seconds;
+                        bool moving0 = false;
+                        bool moving1 = false;
+                        position_at(t0, p0, moving0);
+                        position_at(t1, p1, moving1);
+                        p0 = (std::max)(0.0, p0);
+                        p1 = (std::max)(0.0, p1);
+                        final_position = p1;
+
+                        const double delta = p1 - p0;
+                        double local_rate =
+                            slice_seconds > 0.0 ? delta / slice_seconds : 0.0;
+
+                        // The 8 ms wall-clock slice itself is the jitter filter.
+                        // Keep only a very high safety clamp; ordinary scratching
+                        // should no longer hit it just because two mouse messages
+                        // happened 1 ms apart.
+                        local_rate = std::clamp(
+                            local_rate,
+                            -kScrubMaxSourceRate,
+                            kScrubMaxSourceRate);
+
+                        if ((moving0 || moving1) &&
+                            std::abs(local_rate) > 1.0e-4 &&
+                            std::abs(delta) > move_epsilon) {
+                            cache_manager().request_transport(
+                                p0, local_rate < 0.0);
+
+                            std::vector<float> part;
+                            if (cache_manager().render(
+                                    mode, p0, rate, count,
+                                    part, local_rate) &&
+                                part.size() == count * kCacheChannels) {
+                                std::copy(
+                                    part.begin(), part.end(),
+                                    preview.begin() +
+                                        static_cast<std::ptrdiff_t>(
+                                            rendered_frames * kCacheChannels));
+                                any_audio = true;
+                                newest_rate = local_rate;
+                            }
+                        }
+
+                        rendered_frames += count;
+                    }
+
+                    if (any_audio) {
                         write_preview(preview);
                         g_dbg_last_source_rate.store(
                             newest_rate, std::memory_order_relaxed);
@@ -2777,9 +2811,9 @@ public:
                         write_silence();
                     }
 
-                    // Position is dictated by the hand, never by integration of
-                    // output block duration. This is the core trajectory change.
-                    transport().complete_scrub(ts.position_seconds);
+                    // Debug/render position follows the trajectory time that was
+                    // actually synthesized, not an arbitrarily old DSP snapshot.
+                    transport().complete_scrub(final_position);
                     m_scrubPreviousRate = 0.0;
                     m_scrubRateValid = false;
                 } else {
@@ -2788,6 +2822,7 @@ public:
                     m_scrubRateValid = false;
                     transport().complete_scrub(ts.position_seconds);
                 }
+
                 m_position_seconds += chunk_seconds;
                 m_using_stem = false;
                 return true;
