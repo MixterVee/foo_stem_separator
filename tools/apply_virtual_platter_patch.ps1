@@ -9,7 +9,7 @@ function Replace-Exact([string]$label, [string]$old, [string]$new) {
     $old = $old.Replace("`r`n", "`n")
     $new = $new.Replace("`r`n", "`n")
     if (-not $script:source.Contains($old)) {
-        throw "$label: expected source block not found"
+        throw "${label}: expected source block not found"
     }
     $script:source = $script:source.Replace($old, $new)
 }
