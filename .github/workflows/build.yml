@@ -71,10 +71,6 @@ jobs:
           git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git $sdkRoot
           if (-not (Test-Path $sdkRoot)) { throw "foobar2000 SDK clone failed." }
 
-      - name: Apply stem timeline handoff patch
-        shell: powershell
-        run: .\tools\apply_stem_timeline_handoff_patch.ps1
-
       - name: Build ONNX component
         shell: powershell
         run: |
