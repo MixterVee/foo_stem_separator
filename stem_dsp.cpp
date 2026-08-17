@@ -156,19 +156,23 @@ bool convert_to_cache_stereo(
     size_t frames,
     unsigned channels,
     unsigned sample_rate,
-    std::vector<float>& out) {
+    std::vector<float>& out,
+    size_t exact_output_frames = 0) {
 
     out.clear();
     if (input == nullptr || frames == 0 || channels == 0 || sample_rate == 0) return false;
 
-    size_t output_frames = frames;
-    if (sample_rate != kCacheRate) {
-        output_frames = (std::max)(
-            static_cast<size_t>(1),
-            static_cast<size_t>(std::llround(
-                static_cast<double>(frames) *
-                static_cast<double>(kCacheRate) /
-                static_cast<double>(sample_rate))));
+    size_t output_frames = exact_output_frames;
+    if (output_frames == 0) {
+        output_frames = frames;
+        if (sample_rate != kCacheRate) {
+            output_frames = (std::max)(
+                static_cast<size_t>(1),
+                static_cast<size_t>(std::llround(
+                    static_cast<double>(frames) *
+                    static_cast<double>(kCacheRate) /
+                    static_cast<double>(sample_rate))));
+        }
     }
 
     out.assign(output_frames * kCacheChannels, 0.0f);
@@ -461,6 +465,16 @@ public:
         m_cv.notify_one();
     }
 
+    void transport_flush_seek(double seconds) {
+        if (seconds < 0.0) seconds = 0.0;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // Spectral Waveform uses a seek to the already-armed HOLD/REVERSE/RELEASE
+        // position only to flush queued output. The track and all position-indexed
+        // PCM remain valid, so preserve generation, jobs, rolling history and the
+        // sequential ahead decoder. flush() will make the DSP pick up this anchor.
+        m_anchor_seconds = seconds;
+    }
+
     void stop() {
         std::lock_guard<std::mutex> lock(
             m_mutex);
@@ -577,15 +591,27 @@ public:
             source[i] = static_cast<float>(input[i]);
         }
 
+        const uint64_t new_start_frame = static_cast<uint64_t>(
+            start_seconds * static_cast<double>(kCacheRate) + 0.5);
+        const double source_duration =
+            static_cast<double>(frames) / static_cast<double>(sample_rate);
+        const uint64_t new_end_frame = static_cast<uint64_t>(
+            (start_seconds + source_duration) *
+                static_cast<double>(kCacheRate) + 0.5);
+        const size_t exact_cache_frames = static_cast<size_t>((std::max)(
+            static_cast<uint64_t>(1),
+            new_end_frame > new_start_frame
+                ? new_end_frame - new_start_frame
+                : static_cast<uint64_t>(1)));
+
         std::vector<float> cache_pcm;
         if (!convert_to_cache_stereo(
-                source.data(), frames, channels, sample_rate, cache_pcm) ||
+                source.data(), frames, channels, sample_rate, cache_pcm,
+                exact_cache_frames) ||
             cache_pcm.empty()) {
             return;
         }
 
-        const uint64_t new_start_frame = static_cast<uint64_t>(
-            start_seconds * static_cast<double>(kCacheRate) + 0.5);
         const uint64_t new_frames = static_cast<uint64_t>(
             cache_pcm.size() / kCacheChannels);
         if (new_frames == 0) return;
@@ -2183,6 +2209,19 @@ public:
 
     void on_playback_seek(
         double time) override {
+
+        // HOLD, SCRUB, REVERSE and RELEASE all arm transport first and then seek
+        // to that same sample solely to flush foobar's queued output. Treat that
+        // as a timeline re-anchor, not as a real user seek; otherwise every grab
+        // cancels the platter prefetch job we just started.
+        const int state = transport().state();
+        if (state != stem_transport_normal) {
+            const double transport_position = transport().visible_position();
+            if (std::abs(time - transport_position) <= 0.050) {
+                cache_manager().transport_flush_seek(time);
+                return;
+            }
+        }
 
         cache_manager().seek(time);
     }
