@@ -2038,6 +2038,17 @@ public:
                 m_scrub_velocity = measured;
                 m_scrub_motion_tick = now;
                 m_scrub_audible_until = now + kScrubAudibleSafetyMs;
+            } else if (previous_state == stem_transport_scrub) {
+                // Spectral sends one unchanged SCRUB target after the hand has
+                // been motionless for its short gate. Treat that as a soft platter
+                // stop: silence the next DSP block and snap the render cursor to
+                // the sample under the hand, but DO NOT enter HOLD or seek foobar.
+                // The old hard-HOLD seek could flush the short scratch gesture out
+                // of the output queue before it ever reached the speakers.
+                m_scrub_velocity = 0.0;
+                m_scrub_audible_until = 0;
+                m_scrub_motion_tick = now;
+                m_render_seconds = seconds;
             }
 
             m_state = stem_transport_scrub;
