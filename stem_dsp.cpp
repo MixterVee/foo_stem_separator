@@ -2591,11 +2591,86 @@ public:
 
             auto write_silence = [&]() {
                 if (ts.state == stem_transport_scrub) {
+                    g_dbg_scrub_silence_writes.fetch_add(1, std::memory_order_relaxed);
+                }
+                std::vector<audio_sample> zeros(frames * kCacheChannels, 0);
+
+                if (m_transportTailValid && frames != 0) {
+                    const size_t fade_frames = (std::min)(
+                        frames,
+                        (std::max)(static_cast<size_t>(1),
+                            static_cast<size_t>(static_cast<double>(rate) * 0.0025)));
+
+                    for (size_t f = 0; f < fade_frames; ++f) {
+                        const double gain =
+                            1.0 - static_cast<double>(f + 1) /
+                                static_cast<double>(fade_frames);
+                        for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
+                            zeros[f * kCacheChannels + ch] =
+                                static_cast<audio_sample>(
+                                    static_cast<double>(m_transportTail[ch]) * gain);
+                        }
+                    }
+                    m_transportTailValid = false;
+                }
+
+                chunk->set_data(
+                    zeros.data(), frames, channels, rate, chunk->get_channel_config());
+            };
+
+            auto write_preview = [&](const std::vector<float>& rendered) {
+                if (ts.state == stem_transport_scrub) {
+                    g_dbg_scrub_audio_writes.fetch_add(1, std::memory_order_relaxed);
+                }
+                std::vector<audio_sample> output(rendered.size());
+                for (size_t i = 0; i < rendered.size(); ++i) {
+                    output[i] = static_cast<audio_sample>(rendered[i]);
+                }
+
+                if (m_transportTailValid && frames != 0) {
+                    const size_t blend_frames = (std::min)(
+                        frames,
+                        (std::max)(static_cast<size_t>(1),
+                            static_cast<size_t>(static_cast<double>(rate) * 0.0010)));
+                    for (size_t f = 0; f < blend_frames; ++f) {
+                        const double alpha =
+                            static_cast<double>(f + 1) /
+                            static_cast<double>(blend_frames);
+                        for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
+                            const size_t i = f * kCacheChannels + ch;
+                            output[i] = static_cast<audio_sample>(
+                                static_cast<double>(m_transportTail[ch]) * (1.0 - alpha) +
+                                static_cast<double>(output[i]) * alpha);
+                        }
+                    }
+                }
+
+                chunk->set_data(
+                    output.data(), frames, channels, rate, chunk->get_channel_config());
+
+                if (frames != 0) {
+                    const size_t last = (frames - 1) * kCacheChannels;
+                    for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
+                        m_transportTail[ch] = output[last + ch];
+                    }
+                    m_transportTailValid = true;
+                }
+            };
+
+            if (ts.state == stem_transport_hold) {
+                m_scrubRateValid = false;
+                m_scrubPreviousRate = 0.0;
+                write_silence();
+                m_position_seconds += chunk_seconds;
+                m_using_stem = false;
+                return true;
+            }
+
+            if (ts.state == stem_transport_scrub) {
                 // DJ-style platter engine: the hand supplies a target position and
                 // velocity, while the audio thread owns one continuous virtual
-                // stylus. This is the same separation used by mature DJ engines:
-                // controller updates never become decoder seeks or standalone
-                // chunks of mouse trajectory.
+                // stylus. Controller updates never become decoder seeks or
+                // standalone chunks of mouse trajectory.
                 if (!m_scrubRateValid) {
                     m_scrubRenderPosition = (std::max)(0.0, ts.render_seconds);
                     m_scrubPreviousRate = 0.0;
@@ -2613,12 +2688,11 @@ public:
                 hand_rate = std::clamp(
                     hand_rate, -kScrubMaxSourceRate, kScrubMaxSourceRate);
 
-                double error = ts.position_seconds - m_scrubRenderPosition;
-                const double half_sample =
-                    0.5 / static_cast<double>(rate);
+                const double error = ts.position_seconds - m_scrubRenderPosition;
+                const double half_sample = 0.5 / static_cast<double>(rate);
 
-                // Once the hand is stationary and the stylus has reached it,
-                // behave like a stopped record: no repeated sample/DC tone.
+                // A stopped record is silence, not a repeated sample. Keep the
+                // stylus exactly under the hand without advancing the source.
                 if (std::abs(hand_rate) <= kDjScratchStoppedRate &&
                     std::abs(error) <= half_sample) {
                     m_scrubRenderPosition = ts.position_seconds;
@@ -2630,9 +2704,9 @@ public:
                     return true;
                 }
 
-                // Correct target-vs-stylus phase with a bounded velocity term.
-                // The hand velocity remains primary; position is only the servo
-                // that prevents accumulated drift, rather than a seek request.
+                // Mixxx-style target servo: hand velocity is primary; bounded
+                // position error correction prevents the virtual stylus drifting
+                // away from the platter without turning that target into a seek.
                 const double correction = std::clamp(
                     error / kDjScratchPhaseCorrectionSeconds,
                     -kDjScratchMaxCorrectionRate,
@@ -2643,31 +2717,27 @@ public:
                     kScrubMaxSourceRate);
 
                 const double previous_rate = m_scrubPreviousRate;
-                const bool reversal =
-                    previous_rate * requested_rate < 0.0;
+                const bool reversal = previous_rate * requested_rate < 0.0;
                 const bool strong_deceleration =
                     std::abs(requested_rate) + kDjScratchStrongDecel <
                     std::abs(previous_rate);
 
-                // Mixxx filters ordinary acceleration but deliberately lets hard
-                // deceleration through immediately so the platter does not
-                // overshoot when the hand stops. Direction changes are handled
-                // below by explicitly crossing through zero inside the buffer.
+                // Low-pass ordinary acceleration, but do not smear a strong
+                // slowdown. This mirrors Mixxx's no-filter hard deceleration
+                // behavior so the audio stops with the hand instead of overshooting.
                 double next_rate = requested_rate;
                 if (!reversal && !strong_deceleration) {
                     next_rate =
                         previous_rate * (1.0 - kDjScratchRateFilter) +
                         requested_rate * kDjScratchRateFilter;
                 }
-
                 next_rate = std::clamp(
                     next_rate, -kScrubMaxSourceRate, kScrubMaxSourceRate);
 
                 cache_manager().request_transport(
                     m_scrubRenderPosition, next_rate < 0.0);
 
-                std::vector<float> preview(
-                    frames * kCacheChannels, 0.0f);
+                std::vector<float> preview(frames * kCacheChannels, 0.0f);
                 const size_t slice_frames = (std::max)(
                     static_cast<size_t>(1),
                     static_cast<size_t>(std::llround(
@@ -2677,17 +2747,14 @@ public:
                 auto ramp_rate_at = [&](double x) -> double {
                     x = std::clamp(x, 0.0, 1.0);
                     if (reversal) {
-                        // Mixxx's linear scaler treats a sign flip specially:
-                        // old rate -> zero for the first half, then zero -> new
-                        // rate for the second half. This avoids an instantaneous
-                        // forward/reverse discontinuity.
+                        // Mixxx's linear scratch scaler crosses through zero on
+                        // a direction change rather than flipping sign abruptly.
                         if (x < 0.5) {
                             return previous_rate * (1.0 - 2.0 * x);
                         }
                         return next_rate * (2.0 * x - 1.0);
                     }
-                    return previous_rate +
-                        (next_rate - previous_rate) * x;
+                    return previous_rate + (next_rate - previous_rate) * x;
                 };
 
                 bool any_audio = false;
@@ -2701,11 +2768,8 @@ public:
                         (static_cast<double>(rendered_frames) +
                          0.5 * static_cast<double>(count)) /
                         static_cast<double>(frames);
-                    double local_rate = ramp_rate_at(midpoint);
+                    const double local_rate = ramp_rate_at(midpoint);
 
-                    // Very close to zero, leave this slice silent just like a
-                    // stationary record. Crucially, the source cursor does not
-                    // advance while silent.
                     if (std::abs(local_rate) > kDjScratchStoppedRate) {
                         std::vector<float> part;
                         if (cache_manager().render(
@@ -2729,10 +2793,8 @@ public:
                                     static_cast<double>(rate));
                             any_audio = true;
                         } else {
-                            // Do not move the stylus on a cache miss. The
-                            // producer can catch up without creating the old
-                            // silence cascade where every subsequent render was
-                            // requested from a position we never actually heard.
+                            // On a cache miss, do not advance the stylus. The
+                            // decoder can catch up without causing a silence cascade.
                             cache_manager().request_transport(
                                 source_position, local_rate < 0.0);
                         }
