@@ -79,6 +79,11 @@ constexpr double kDecodeSeekPrerollSeconds = 5.0;
 // so use a short preroll to avoid decoding/discarding five seconds on every
 // random hand movement.
 constexpr double kOriginalDecodeSeekPrerollSeconds = 0.50;
+// Keep already-decoded Original PCM in RAM for platter work. At 44.1 kHz stereo
+// float, 45 seconds is only about 15 MB and removes decoder-seek latency from
+// normal scratches around the current playhead.
+constexpr double kOriginalRollingSeconds = 45.0;
+constexpr uint64_t kOriginalRollingJoinToleranceFrames = 8;
 constexpr double kFirstBlockFadeSeconds = 0.005;
 // Spectral Waveform now explicitly returns scrub transport to HOLD after real
 // mouse motion stops. Keep this slightly longer timeout as a safety net only.
@@ -375,6 +380,8 @@ public:
         m_anchor_seconds = 0.0;
 
         m_segments.clear();
+        m_live_original.clear();
+        m_live_original_start_frame = 0;
         m_jobs.clear();
         m_job_pending = false;
 
@@ -453,6 +460,8 @@ public:
         m_anchor_seconds = 0.0;
 
         m_segments.clear();
+        m_live_original.clear();
+        m_live_original_start_frame = 0;
         m_jobs.clear();
         m_job_pending = false;
     }
@@ -534,6 +543,97 @@ public:
 
             queue_job_locked(next);
             m_cv.notify_one();
+        }
+    }
+
+    void publish_live_original(
+        double start_seconds,
+        const audio_sample* input,
+        size_t frames,
+        unsigned channels,
+        unsigned sample_rate) {
+
+        if (input == nullptr || frames == 0 || channels == 0 || sample_rate == 0) return;
+        if (start_seconds < 0.0) start_seconds = 0.0;
+
+        // audio_sample is foobar's decoded float PCM. Convert/resample outside the
+        // cache lock so the realtime callback only holds the mutex while appending.
+        std::vector<float> source(frames * channels);
+        for (size_t i = 0; i < source.size(); ++i) {
+            source[i] = static_cast<float>(input[i]);
+        }
+
+        std::vector<float> cache_pcm;
+        if (!convert_to_cache_stereo(
+                source.data(), frames, channels, sample_rate, cache_pcm) ||
+            cache_pcm.empty()) {
+            return;
+        }
+
+        const uint64_t new_start_frame = static_cast<uint64_t>(
+            start_seconds * static_cast<double>(kCacheRate) + 0.5);
+        const uint64_t new_frames = static_cast<uint64_t>(
+            cache_pcm.size() / kCacheChannels);
+        if (new_frames == 0) return;
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_path.empty()) return;
+
+        if (m_live_original.empty()) {
+            m_live_original_start_frame = new_start_frame;
+        } else {
+            const uint64_t live_frames = static_cast<uint64_t>(
+                m_live_original.size() / kCacheChannels);
+            const uint64_t live_end_frame = m_live_original_start_frame + live_frames;
+
+            // A far seek starts a new rolling region. A HOLD self-seek or ordinary
+            // overlapping callback stays inside the existing region and preserves
+            // the already-heard history behind the platter.
+            if (new_start_frame > live_end_frame + kOriginalRollingJoinToleranceFrames ||
+                new_start_frame + new_frames + kOriginalRollingJoinToleranceFrames <
+                    m_live_original_start_frame) {
+                m_live_original.clear();
+                m_live_original_start_frame = new_start_frame;
+            }
+        }
+
+        uint64_t live_frames = static_cast<uint64_t>(
+            m_live_original.size() / kCacheChannels);
+        uint64_t live_end_frame = m_live_original_start_frame + live_frames;
+
+        // If the new callback begins a few rounding frames after our end, align it
+        // rather than inserting silence. Larger gaps were handled as a new region.
+        uint64_t effective_start = new_start_frame;
+        if (effective_start > live_end_frame &&
+            effective_start <= live_end_frame + kOriginalRollingJoinToleranceFrames) {
+            effective_start = live_end_frame;
+        }
+
+        size_t skip_frames = 0;
+        if (effective_start < live_end_frame) {
+            const uint64_t overlap = live_end_frame - effective_start;
+            if (overlap >= new_frames) {
+                return;
+            }
+            skip_frames = static_cast<size_t>(overlap);
+        }
+
+        const size_t first_value = skip_frames * kCacheChannels;
+        for (size_t i = first_value; i < cache_pcm.size(); ++i) {
+            m_live_original.push_back(cache_pcm[i]);
+        }
+
+        const uint64_t max_frames = static_cast<uint64_t>(
+            kOriginalRollingSeconds * static_cast<double>(kCacheRate) + 0.5);
+        live_frames = static_cast<uint64_t>(m_live_original.size() / kCacheChannels);
+        if (live_frames > max_frames) {
+            const uint64_t drop_frames = live_frames - max_frames;
+            const size_t drop_values = static_cast<size_t>(
+                drop_frames * kCacheChannels);
+            for (size_t i = 0; i < drop_values; ++i) {
+                m_live_original.pop_front();
+            }
+            m_live_original_start_frame += drop_frames;
         }
     }
 
@@ -682,6 +782,44 @@ public:
         {
             std::lock_guard<std::mutex> lock(
                 m_mutex);
+
+            if (mode == stemmode::mode::original && !m_live_original.empty()) {
+                const size_t live_frames = m_live_original.size() / kCacheChannels;
+                const double live_start = static_cast<double>(
+                    m_live_original_start_frame) / static_cast<double>(kCacheRate);
+                const double live_end = live_start +
+                    static_cast<double>(live_frames) / static_cast<double>(kCacheRate);
+                const double last_t = start_seconds +
+                    source_rate * static_cast<double>(frames - 1) /
+                    static_cast<double>(output_rate);
+                const double need_start = (std::min)(start_seconds, last_t);
+                const double need_end = (std::max)(start_seconds, last_t);
+
+                if (need_start >= live_start - 1.0e-9 &&
+                    need_end < live_end && live_frames != 0) {
+                    out.assign(frames * kCacheChannels, 0.0f);
+                    const double dt = 1.0 / static_cast<double>(output_rate);
+                    for (size_t f = 0; f < frames; ++f) {
+                        const double t = start_seconds +
+                            source_rate * static_cast<double>(f) * dt;
+                        double source_pos =
+                            t * static_cast<double>(kCacheRate) -
+                            static_cast<double>(m_live_original_start_frame);
+                        if (source_pos < 0.0) source_pos = 0.0;
+                        size_t i0 = static_cast<size_t>(source_pos);
+                        if (i0 >= live_frames) i0 = live_frames - 1;
+                        const size_t i1 = (std::min)(i0 + 1, live_frames - 1);
+                        const float frac = static_cast<float>(
+                            source_pos - static_cast<double>(i0));
+                        for (unsigned ch = 0; ch < kCacheChannels; ++ch) {
+                            const float a = m_live_original[i0 * kCacheChannels + ch];
+                            const float b = m_live_original[i1 * kCacheChannels + ch];
+                            out[f * kCacheChannels + ch] = a + (b - a) * frac;
+                        }
+                    }
+                    return true;
+                }
+            }
 
             if (m_segments.empty()) {
                 return false;
@@ -1771,6 +1909,12 @@ private:
 
     std::deque<cache_job> m_jobs;
     std::deque<std::shared_ptr<cache_segment>> m_segments;
+
+    // Directly harvested from foobar's decoded Original stream. Unlike cache
+    // jobs, this region is already in RAM and cannot be invalidated by rapid
+    // platter retargeting.
+    std::deque<float> m_live_original;
+    uint64_t m_live_original_start_frame = 0;
 };
 
 live_cache_manager& cache_manager() {
@@ -2141,6 +2285,14 @@ public:
 
         const stemmode::mode mode =
             stemmode::get();
+
+        // Harvest foobar's already-decoded Original PCM before HOLD/SCRUB/REVERSE
+        // replaces this chunk. During transport the underlying decoder keeps moving,
+        // so the RAM platter buffer naturally grows ahead while retaining history.
+        if (mode == stemmode::mode::original) {
+            cache_manager().publish_live_original(
+                m_position_seconds, chunk->get_data(), frames, channels, rate);
+        }
 
         // Transport preview keeps foobar's audio clock running while replacing
         // what is heard. That gives us a real stationary HOLD, audible jog, and
