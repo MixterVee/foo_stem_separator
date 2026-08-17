@@ -71,18 +71,6 @@ jobs:
           git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git $sdkRoot
           if (-not (Test-Path $sdkRoot)) { throw "foobar2000 SDK clone failed." }
 
-      - name: Apply xwax-style virtual platter patch
-        shell: powershell
-        run: .\tools\apply_virtual_platter_patch.ps1
-
-      - name: Apply latency-aware platter reanchor patch
-        shell: powershell
-        run: .\tools\apply_latency_reanchor_patch.ps1
-
-      - name: Apply proactive fast stem-start patch
-        shell: powershell
-        run: .\tools\apply_fast_stem_start_patch.ps1
-
       - name: Build ONNX component
         shell: powershell
         run: |
