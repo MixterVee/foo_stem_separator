@@ -1,0 +1,25 @@
+name: Apply Original fast scratch seek
+
+on:
+  push:
+    paths:
+      - '.github/original_fast_seek_patch.py'
+      - '.github/workflows/apply-original-fast-seek.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patch
+        run: python .github/original_fast_seek_patch.py
+      - name: Commit source change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stem_dsp.cpp
+          git commit -m "Reduce Original scratch decode latency"
+          git push
