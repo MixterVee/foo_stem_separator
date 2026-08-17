@@ -79,6 +79,10 @@ jobs:
         shell: powershell
         run: .\tools\apply_latency_reanchor_patch.ps1
 
+      - name: Apply proactive fast stem-start patch
+        shell: powershell
+        run: .\tools\apply_fast_stem_start_patch.ps1
+
       - name: Build ONNX component
         shell: powershell
         run: |
