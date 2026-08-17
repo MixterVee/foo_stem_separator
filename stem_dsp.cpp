@@ -2691,12 +2691,21 @@ public:
                 const double error = ts.position_seconds - m_scrubRenderPosition;
                 const double half_sample = 0.5 / static_cast<double>(rate);
 
-                // A stopped record is silence, not a repeated sample. Keep the
-                // stylus exactly under the hand without advancing the source.
-                if (std::abs(hand_rate) <= kDjScratchStoppedRate &&
-                    std::abs(error) <= half_sample) {
-                    m_scrubRenderPosition = ts.position_seconds;
+                // Once real mouse motion has stopped, the platter is physically
+                // stationary. Snap the virtual stylus to the held hand position and
+                // silence it immediately instead of allowing the phase-correction
+                // servo to keep crawling through/repeating audio. write_silence()
+                // already applies the short transport-tail de-click fade.
+                const bool no_recent_motion =
+                    motion_age > kDjScratchMotionGraceSeconds;
+
+                if (no_recent_motion ||
+                    (std::abs(hand_rate) <= kDjScratchStoppedRate &&
+                     std::abs(error) <= half_sample)) {
+                    m_scrubRenderPosition = (std::max)(0.0, ts.position_seconds);
                     m_scrubPreviousRate = 0.0;
+                    g_dbg_last_source_rate.store(
+                        0.0, std::memory_order_relaxed);
                     transport().complete_scrub(m_scrubRenderPosition);
                     write_silence();
                     m_position_seconds += chunk_seconds;
