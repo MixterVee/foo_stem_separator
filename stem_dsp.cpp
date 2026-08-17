@@ -101,7 +101,12 @@ constexpr double kScrubGestureDefaultDt = 0.016;
 constexpr double kScrubGestureMinDt = 0.004;
 constexpr double kScrubGestureMaxDt = 0.080;
 constexpr double kScrubMaxSourceRate = 24.0;
-constexpr double kScrubPhaseCorrectionMix = 0.22;
+// A real platter follows hand velocity; it does not bend pitch to catch a
+// position target. Smooth only a little mouse timestamp jitter, then ramp each
+// DSP block from the last audible velocity to the latest hand velocity.
+constexpr double kScrubVelocityCarry = 0.25;
+constexpr double kScrubRateRampSeconds = 0.012;
+constexpr double kScrubNearZeroRate = 0.015;
 
 std::atomic<uint64_t> g_dbg_render_attempts{0};
 std::atomic<uint64_t> g_dbg_render_successes{0};
@@ -2095,12 +2100,15 @@ public:
                 measured = std::clamp(
                     measured, -kScrubMaxSourceRate, kScrubMaxSourceRate);
 
-                // Preserve quick direction changes. Only a small amount of
-                // same-direction carry removes mouse timestamp jitter; unlike the
-                // previous experiment, this is not a low-pass platter filter.
+                // Keep reversals immediate, but remove a little timestamp jitter
+                // while the hand continues in the same direction. The audio-side
+                // renderer performs the short acceleration ramp; this estimate is
+                // still fundamentally distance / wall-clock time.
                 if (previous_state == stem_transport_scrub &&
                     measured * m_scrub_velocity > 0.0) {
-                    measured = 0.20 * m_scrub_velocity + 0.80 * measured;
+                    measured =
+                        kScrubVelocityCarry * m_scrub_velocity +
+                        (1.0 - kScrubVelocityCarry) * measured;
                 }
 
                 m_scrub_velocity = measured;
@@ -2552,96 +2560,113 @@ public:
                 if (fresh_motion &&
                     (std::abs(delta) > move_epsilon ||
                      std::abs(ts.scrub_velocity) > 1.0e-4)) {
-                    const double output_span =
-                        frames > 1
-                            ? static_cast<double>(frames - 1) /
-                                static_cast<double>(rate)
-                            : chunk_seconds;
+                    // Vinyl rule: pitch/speed is the hand velocity. Do not
+                    // distort pitch to chase position error. The render cursor is
+                    // allowed to trail the newest mouse target by the actual output
+                    // latency, then the soft-idle handoff re-anchors it exactly when
+                    // the hand stops.
+                    const double target_rate = std::clamp(
+                        ts.scrub_velocity,
+                        -kScrubMaxSourceRate,
+                        kScrubMaxSourceRate);
+                    const double start_rate =
+                        m_scrubRateValid ? m_scrubPreviousRate : 0.0;
+                    const double ramp_seconds = (std::min)(
+                        kScrubRateRampSeconds, chunk_seconds);
 
-                    // Primary rate comes from mouse distance / wall-clock time.
-                    // This is the key difference from the previous renderer: an
-                    // identical hand gesture now has the same pitch/speed no matter
-                    // which foobar DSP block size happens to carry it.
-                    double source_rate = ts.scrub_velocity;
-
-                    if (output_span > 0.0 && std::abs(delta) > move_epsilon) {
-                        const double block_align_rate = delta / output_span;
-                        const double correction_limit = (std::max)(
-                            0.75, std::abs(source_rate) * 0.50);
-                        const double correction = std::clamp(
-                            (block_align_rate - source_rate) *
-                                kScrubPhaseCorrectionMix,
-                            -correction_limit, correction_limit);
-                        source_rate += correction;
-
-                        // Never run through the visible hand position in the same
-                        // direction. When we are already close, land exactly on it.
-                        if (delta * source_rate > 0.0 &&
-                            std::abs(source_rate * output_span) >
-                                std::abs(delta)) {
-                            source_rate = block_align_rate;
-                        }
+                    double predicted_move = target_rate * chunk_seconds;
+                    if (ramp_seconds > 0.0) {
+                        predicted_move =
+                            0.5 * (start_rate + target_rate) * ramp_seconds +
+                            target_rate * (chunk_seconds - ramp_seconds);
                     }
-
-                    source_rate = std::clamp(
-                        source_rate, -kScrubMaxSourceRate, kScrubMaxSourceRate);
-
                     const double desired_next_render = (std::max)(
-                        0.0, ts.render_seconds + source_rate * chunk_seconds);
-
-                    // Prefetch toward the full hand-speed destination even if this
-                    // callback later has to use a slower cached fallback. This lets
-                    // the renderer catch the hand as soon as PCM becomes available.
+                        0.0, ts.render_seconds + predicted_move);
                     cache_manager().request_transport(
-                        desired_next_render, source_rate < 0.0);
+                        desired_next_render, predicted_move < 0.0);
 
                     std::vector<float> preview;
-                    bool rendered_ok = false;
-                    double rendered_rate = source_rate;
+                    preview.reserve(frames * kCacheChannels);
+                    bool rendered_ok = true;
+                    double render_cursor = ts.render_seconds;
+                    size_t rendered_frames = 0;
+                    const size_t subblock_frames = (std::max)(
+                        static_cast<size_t>(1),
+                        static_cast<size_t>(std::llround(
+                            kScrubSubBlockSeconds * static_cast<double>(rate))));
 
-                    // A fast gesture can cross the edge of the currently cached
-                    // transport window. Do not turn that one boundary miss into a
-                    // whole silent block. Retry using progressively shorter source
-                    // spans that stay closer to the last known-good audible cursor.
-                    // The requested full-speed destination remains queued above.
-                    constexpr double kFallbackScales[] = {
-                        1.0, 0.75, 0.50, 0.25
-                    };
+                    while (rendered_frames < frames) {
+                        const size_t count = (std::min)(
+                            subblock_frames, frames - rendered_frames);
+                        const double midpoint_seconds =
+                            (static_cast<double>(rendered_frames) +
+                             0.5 * static_cast<double>(count)) /
+                            static_cast<double>(rate);
 
-                    if (std::abs(source_rate) > 1.0e-6) {
-                        for (double scale : kFallbackScales) {
-                            const double trial_rate = source_rate * scale;
-                            preview.clear();
-                            if (cache_manager().render(
-                                    mode, ts.render_seconds, rate, frames,
-                                    preview, trial_rate) &&
-                                preview.size() == frames * kCacheChannels) {
-                                rendered_rate = trial_rate;
-                                rendered_ok = true;
-                                break;
-                            }
+                        double local_rate = target_rate;
+                        if (ramp_seconds > 1.0e-9 &&
+                            midpoint_seconds < ramp_seconds) {
+                            const double alpha = std::clamp(
+                                midpoint_seconds / ramp_seconds, 0.0, 1.0);
+                            local_rate =
+                                start_rate + (target_rate - start_rate) * alpha;
                         }
+
+                        const double sub_seconds =
+                            static_cast<double>(count) /
+                            static_cast<double>(rate);
+
+                        // At the exact reversal point a physical record passes
+                        // through zero speed. Repeating one digital sample creates
+                        // a DC-like click, so make only that tiny near-zero interval
+                        // silent while the velocity crosses through zero.
+                        if (std::abs(local_rate) < kScrubNearZeroRate) {
+                            preview.insert(
+                                preview.end(), count * kCacheChannels, 0.0f);
+                            rendered_frames += count;
+                            continue;
+                        }
+
+                        // Do not read before 0:00 when a backward stroke reaches the
+                        // physical start of the file. Land on the edge instead.
+                        if (local_rate < 0.0 &&
+                            render_cursor + local_rate * sub_seconds < 0.0) {
+                            local_rate = -render_cursor / sub_seconds;
+                        }
+
+                        std::vector<float> part;
+                        if (!cache_manager().render(
+                                mode, render_cursor, rate, count,
+                                part, local_rate) ||
+                            part.size() != count * kCacheChannels) {
+                            rendered_ok = false;
+                            break;
+                        }
+
+                        preview.insert(preview.end(), part.begin(), part.end());
+                        render_cursor = (std::max)(
+                            0.0, render_cursor + local_rate * sub_seconds);
+                        rendered_frames += count;
                     }
 
-                    if (rendered_ok) {
+                    if (rendered_ok &&
+                        preview.size() == frames * kCacheChannels) {
                         write_preview(preview);
-
-                        // Advance only by audio that was actually produced. The old
-                        // wall-clock build advanced to next_render even after render()
-                        // failed, pushing the next callback deeper into uncached PCM
-                        // and creating the silence cascade seen in the recording.
-                        const double rendered_next = (std::max)(
-                            0.0,
-                            ts.render_seconds + rendered_rate * chunk_seconds);
-                        transport().complete_scrub(rendered_next);
+                        transport().complete_scrub(render_cursor);
+                        m_scrubPreviousRate = target_rate;
+                        m_scrubRateValid = true;
                     } else {
-                        // Hold the last known-good audible cursor while the requested
-                        // destination is being prefetched. A later callback retries
-                        // from valid PCM instead of skipping over the missing region.
+                        // Never change pitch merely to stay inside cache. A miss is
+                        // preferable to the old 75/50/25% speed fallback because
+                        // that fallback was audibly changing the scratch gesture.
                         write_silence();
+                        m_scrubPreviousRate = 0.0;
+                        m_scrubRateValid = false;
                     }
                 } else {
                     write_silence();
+                    m_scrubPreviousRate = 0.0;
+                    m_scrubRateValid = false;
                     if (std::abs(delta) > move_epsilon) {
                         transport().complete_scrub(ts.position_seconds);
                     }
