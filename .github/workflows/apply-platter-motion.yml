@@ -1,0 +1,25 @@
+name: Apply platter motion renderer
+
+on:
+  push:
+    paths:
+      - '.github/platter_motion_patch.py'
+      - '.github/workflows/apply-platter-motion.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply platter motion patch
+        run: python .github/platter_motion_patch.py
+      - name: Commit source change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stem_dsp.cpp
+          git commit -m "Use velocity-driven platter scratch renderer"
+          git push
