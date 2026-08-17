@@ -1,0 +1,43 @@
+name: Encode DirectML deliverable for handoff
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ agent/directml-ab ]
+    paths:
+      - '.github/workflows/encode-directml-deliverable.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  encode:
+    runs-on: windows-2022
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+
+      - name: Encode component as base64 text
+        shell: powershell
+        run: |
+          $src = "$env:GITHUB_WORKSPACE\deliverables\foo_stem_separator-directml-adapter1.fb2k-component"
+          if (-not (Test-Path $src)) { throw "DirectML component deliverable is missing." }
+          $bytes = [System.IO.File]::ReadAllBytes($src)
+          $b64 = [Convert]::ToBase64String($bytes)
+          $dst = "$src.b64"
+          [System.IO.File]::WriteAllText($dst, $b64, [System.Text.Encoding]::ASCII)
+          Write-Host "Encoded $($bytes.Length) bytes."
+
+      - name: Commit encoded handoff file
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deliverables/foo_stem_separator-directml-adapter1.fb2k-component.b64
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Encoded handoff already current."
+            exit 0
+          }
+          git commit -m "Encode DirectML adapter 1 test component"
+          git push origin HEAD:agent/directml-ab
