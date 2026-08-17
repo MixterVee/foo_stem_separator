@@ -98,15 +98,15 @@ constexpr double kScrubKeepaliveToleranceSeconds = 0.002;
 constexpr double kScrubSubBlockSeconds = 0.004;
 constexpr double kScrubCarrySlopeLimit = 2.0;
 constexpr double kScrubGestureDefaultDt = 0.016;
-constexpr double kScrubGestureMinDt = 0.004;
-constexpr double kScrubGestureMaxDt = 0.080;
+constexpr double kScrubGestureMinDt = 0.001;
+constexpr double kScrubGestureMaxDt = 0.250;
 constexpr double kScrubMaxSourceRate = 24.0;
-// A real platter follows hand velocity; it does not bend pitch to catch a
-// position target. Smooth only a little mouse timestamp jitter, then ramp each
-// DSP block from the last audible velocity to the latest hand velocity.
-constexpr double kScrubVelocityCarry = 0.25;
-constexpr double kScrubRateRampSeconds = 0.012;
-constexpr double kScrubNearZeroRate = 0.015;
+// Pitch follows measured hand velocity. Keep only a very short audio-side ramp
+// for click-free acceleration, and sample-lock the virtual stylus whenever its
+// integrated cursor drifts materially away from the actual hand position.
+constexpr double kScrubRateRampSeconds = 0.006;
+constexpr double kScrubMaxCursorErrorSeconds = 0.060;
+constexpr double kScrubReversalReanchorErrorSeconds = 0.015;
 
 std::atomic<uint64_t> g_dbg_render_attempts{0};
 std::atomic<uint64_t> g_dbg_render_successes{0};
@@ -2060,6 +2060,7 @@ public:
             m_scrub_audible_until = 0;
             m_scrub_velocity = 0.0;
             m_scrub_motion_tick = GetTickCount64();
+            m_scrub_motion_clock = std::chrono::steady_clock::now();
         }
         cache_manager().request_transport(seconds, false);
     }
@@ -2073,6 +2074,7 @@ public:
             const int previous_state = m_state;
             const double previous_position = m_position_seconds;
             const ULONGLONG now = GetTickCount64();
+            const auto now_clock = std::chrono::steady_clock::now();
 
             retarget =
                 previous_state != stem_transport_scrub ||
@@ -2089,30 +2091,24 @@ public:
             if (retarget) {
                 double dt = kScrubGestureDefaultDt;
                 if (previous_state == stem_transport_scrub &&
-                    m_scrub_motion_tick != 0 && now > m_scrub_motion_tick) {
+                    m_scrub_motion_clock.time_since_epoch().count() != 0) {
                     dt = std::clamp(
-                        static_cast<double>(now - m_scrub_motion_tick) / 1000.0,
+                        std::chrono::duration<double>(
+                            now_clock - m_scrub_motion_clock).count(),
                         kScrubGestureMinDt, kScrubGestureMaxDt);
                 }
 
+                // Use the actual high-resolution event interval. Do not carry the
+                // previous speed into this measurement; that was making slow mouse
+                // gestures chirp after irregular Windows message spacing.
                 double measured =
                     dt > 0.0 ? (seconds - previous_position) / dt : 0.0;
                 measured = std::clamp(
                     measured, -kScrubMaxSourceRate, kScrubMaxSourceRate);
 
-                // Keep reversals immediate, but remove a little timestamp jitter
-                // while the hand continues in the same direction. The audio-side
-                // renderer performs the short acceleration ramp; this estimate is
-                // still fundamentally distance / wall-clock time.
-                if (previous_state == stem_transport_scrub &&
-                    measured * m_scrub_velocity > 0.0) {
-                    measured =
-                        kScrubVelocityCarry * m_scrub_velocity +
-                        (1.0 - kScrubVelocityCarry) * measured;
-                }
-
                 m_scrub_velocity = measured;
                 m_scrub_motion_tick = now;
+                m_scrub_motion_clock = now_clock;
                 m_scrub_audible_until = now + kScrubAudibleSafetyMs;
             } else if (previous_state == stem_transport_scrub) {
                 // Spectral sends one unchanged SCRUB target after the hand has
@@ -2124,6 +2120,7 @@ public:
                 m_scrub_velocity = 0.0;
                 m_scrub_audible_until = 0;
                 m_scrub_motion_tick = now;
+                m_scrub_motion_clock = now_clock;
                 m_render_seconds = seconds;
             }
 
@@ -2147,6 +2144,7 @@ public:
             m_scrub_audible_until = 0;
             m_scrub_velocity = 0.0;
             m_scrub_motion_tick = 0;
+            m_scrub_motion_clock = {};
         }
         cache_manager().request_transport(seconds, true);
     }
@@ -2161,6 +2159,7 @@ public:
             m_scrub_audible_until = 0;
             m_scrub_velocity = 0.0;
             m_scrub_motion_tick = 0;
+            m_scrub_motion_clock = {};
         }
         cache_manager().request_transport(seconds, false);
     }
@@ -2171,6 +2170,7 @@ public:
         m_scrub_audible_until = 0;
         m_scrub_velocity = 0.0;
         m_scrub_motion_tick = 0;
+        m_scrub_motion_clock = {};
     }
 
     transport_snapshot snapshot() const {
@@ -2224,6 +2224,7 @@ private:
     ULONGLONG m_scrub_audible_until = 0;
     double m_scrub_velocity = 0.0;
     ULONGLONG m_scrub_motion_tick = 0;
+    std::chrono::steady_clock::time_point m_scrub_motion_clock{};
 };
 
 transport_controller& transport() {
@@ -2571,6 +2572,23 @@ public:
                         kScrubMaxSourceRate);
                     const double start_rate =
                         m_scrubRateValid ? m_scrubPreviousRate : 0.0;
+                    const bool direction_reversal =
+                        m_scrubRateValid &&
+                        target_rate * m_scrubPreviousRate < 0.0;
+                    const bool large_cursor_drift =
+                        std::abs(delta) > kScrubMaxCursorErrorSeconds;
+                    const bool reversal_cursor_drift =
+                        direction_reversal &&
+                        std::abs(delta) > kScrubReversalReanchorErrorSeconds;
+
+                    // Keep the audible stylus attached to the hand. The previous
+                    // velocity-only build could integrate nearly a second away from
+                    // the visible mouse position; that can never resemble a record.
+                    double render_cursor =
+                        (large_cursor_drift || reversal_cursor_drift)
+                            ? ts.position_seconds
+                            : ts.render_seconds;
+
                     const double ramp_seconds = (std::min)(
                         kScrubRateRampSeconds, chunk_seconds);
 
@@ -2581,14 +2599,13 @@ public:
                             target_rate * (chunk_seconds - ramp_seconds);
                     }
                     const double desired_next_render = (std::max)(
-                        0.0, ts.render_seconds + predicted_move);
+                        0.0, render_cursor + predicted_move);
                     cache_manager().request_transport(
                         desired_next_render, predicted_move < 0.0);
 
                     std::vector<float> preview;
                     preview.reserve(frames * kCacheChannels);
                     bool rendered_ok = true;
-                    double render_cursor = ts.render_seconds;
                     size_t rendered_frames = 0;
                     const size_t subblock_frames = (std::max)(
                         static_cast<size_t>(1),
@@ -2616,16 +2633,9 @@ public:
                             static_cast<double>(count) /
                             static_cast<double>(rate);
 
-                        // At the exact reversal point a physical record passes
-                        // through zero speed. Repeating one digital sample creates
-                        // a DC-like click, so make only that tiny near-zero interval
-                        // silent while the velocity crosses through zero.
-                        if (std::abs(local_rate) < kScrubNearZeroRate) {
-                            preview.insert(
-                                preview.end(), count * kCacheChannels, 0.0f);
-                            rendered_frames += count;
-                            continue;
-                        }
+                        // Let the rate pass continuously through zero on a
+                        // reversal. The previous explicit silent slice audibly gated
+                        // every direction change and produced a synthetic chop.
 
                         // Do not read before 0:00 when a backward stroke reaches the
                         // physical start of the file. Land on the edge instead.
