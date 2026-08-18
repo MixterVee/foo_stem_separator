@@ -1,9 +1,19 @@
-name: Build stable foobar2000 Stem Separator
+name: Build dynamic DirectML Stem Separator test
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ agent/dynamic-directml-adapters ]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'build-ci-v12.ps1'
+      - 'onnx_stem_engine.cpp'
+      - 'onnx_stem_engine.h'
+      - 'stem_benchmark.cpp'
+
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   build:
@@ -12,6 +22,20 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Record run id for chat handoff
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\deliverables" | Out-Null
+          Set-Content "$env:GITHUB_WORKSPACE\deliverables\dynamic-adapters-run-id.txt" "$env:GITHUB_RUN_ID" -Encoding ascii
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deliverables/dynamic-adapters-run-id.txt
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Record dynamic adapter test run id"
+            git push origin HEAD:agent/dynamic-directml-adapters
+          }
 
       - name: Add Visual Studio 2022 MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -68,19 +92,6 @@ jobs:
           git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git $sdkRoot
           if (-not (Test-Path $sdkRoot)) { throw "foobar2000 SDK clone failed." }
 
-      - name: Include backend benchmark source
-        shell: powershell
-        run: |
-          $path = "$env:GITHUB_WORKSPACE\build-ci-v12.ps1"
-          $text = Get-Content $path -Raw
-          $old = '    "stem_waveform_provider.cpp"'
-          if ($text -notmatch 'stem_benchmark\.cpp') {
-            $new = $old + ',' + "`r`n" + '    "stem_benchmark.cpp"'
-            if (-not $text.Contains($old)) { throw "Build source insertion point not found." }
-            $text = $text.Replace($old, $new)
-            Set-Content -Path $path -Value $text -Encoding UTF8
-          }
-
       - name: Build Stem Separator DLL
         shell: powershell
         run: |
@@ -135,8 +146,6 @@ jobs:
           foreach ($required in @("sherpa-onnx-c-api.dll", "onnxruntime.dll", "DirectML.dll")) {
             if (-not (Test-Path "$dist\$required")) { throw "Missing runtime file: $required" }
           }
-          Set-Content "$dist\directml-device0.config" "device_id=0" -Encoding ascii
-          Set-Content "$dist\directml-device1.config" "device_id=1" -Encoding ascii
 
       - name: Download Spleeter ONNX models
         shell: powershell
@@ -158,22 +167,24 @@ jobs:
           Copy-Item $vocals.FullName "$modelDir\vocals.fp16.onnx" -Force
           Copy-Item $accomp.FullName "$modelDir\accompaniment.fp16.onnx" -Force
 
-      - name: Create stable fb2k component package
+      - name: Create dynamic-adapter test package
         shell: powershell
         run: |
           $dist = "$env:GITHUB_WORKSPACE\dist"
           Set-Content "$dist\BACKENDS.txt" @(
-            "Stem Separator selectable processing backend",
-            "Benchmark: TIME lower is better; SPEED vs CPU higher is better.",
-            "Available choices: CPU, DirectML adapter 0, DirectML adapter 1."
+            "Stem Separator dynamic DirectML adapter test",
+            "Enumerates every hardware DXGI adapter and benchmarks each DirectML backend.",
+            "GPU preference is saved by hardware identity rather than adapter index.",
+            "Missing or failed preferred GPU falls back to CPU automatically.",
+            "Benchmark: TIME lower is better; SPEED vs CPU higher is better."
           ) -Encoding UTF8
-          $tempZip = "$env:RUNNER_TEMP\foo_stem_separator.zip"
+          $tempZip = "$env:RUNNER_TEMP\foo_stem_separator-dynamic-adapters.zip"
           Compress-Archive -Path "$dist\*" -DestinationPath $tempZip -Force
-          Copy-Item $tempZip "$dist\foo_stem_separator.fb2k-component" -Force
+          Copy-Item $tempZip "$dist\foo_stem_separator-dynamic-adapters.fb2k-component" -Force
 
-      - name: Upload stable component
+      - name: Upload dynamic-adapter test component
         uses: actions/upload-artifact@v4
         with:
-          name: foo_stem_separator-stable
+          name: foo_stem_separator-dynamic-adapters
           path: dist/**
           if-no-files-found: error
