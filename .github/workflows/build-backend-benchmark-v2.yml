@@ -204,3 +204,5 @@ jobs:
           name: foo_stem_separator-backend-benchmark-v1
           path: dist/**
           if-no-files-found: error
+
+# Ready for stable promotion.
