@@ -13,18 +13,27 @@ jobs:
   promote:
     runs-on: windows-2022
     steps:
-      - name: Check out tested persistent cache branch
+      - name: Check out stable main
         uses: actions/checkout@v4
         with:
-          ref: agent/persistent-stem-cache
+          ref: main
           fetch-depth: 0
 
-      - name: Materialize exact tested v2 patch
+      - name: Promote exact tested persistent cache v2 source
         shell: powershell
         run: |
-          python .\patch-persistent-cache.py
-          if ($LASTEXITCODE -ne 0) { throw "Persistent cache patch failed." }
+          git fetch origin agent/persistent-stem-cache
 
+          # Bring in the exact cache module that was packaged in the accepted v2 build.
+          git checkout origin/agent/persistent-stem-cache -- persistent_stem_cache.cpp persistent_stem_cache.h
+
+          # Materialize the exact tested build-time v2 integration into stable stem_dsp.cpp.
+          git show origin/agent/persistent-stem-cache:patch-persistent-cache.py | Set-Content .\patch-persistent-cache.py -Encoding UTF8
+          python .\patch-persistent-cache.py
+          if ($LASTEXITCODE -ne 0) { throw "Persistent cache v2 patch failed." }
+          Remove-Item .\patch-persistent-cache.py -Force
+
+          # Make the cache module a permanent part of the normal stable build.
           $buildScript = "build-ci-v12.ps1"
           $text = Get-Content $buildScript -Raw
           if ($text -notmatch 'persistent_stem_cache\.cpp') {
@@ -42,11 +51,10 @@ jobs:
           }
           Set-Content $buildScript $text -Encoding UTF8
 
-          New-Item -ItemType Directory -Force deliverables | Out-Null
-          Set-Content deliverables/persistent-cache-promotion-run-id.txt "$env:GITHUB_RUN_ID" -Encoding ascii
-
+          # One clean stable commit: real source only, no promotion scaffolding.
+          git rm .github/workflows/promote-persistent-cache-source.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add stem_dsp.cpp build-ci-v12.ps1 deliverables/persistent-cache-promotion-run-id.txt
-          git commit -m "Materialize tested persistent cache v2 source"
-          git push origin HEAD:agent/persistent-stem-cache
+          git add stem_dsp.cpp build-ci-v12.ps1 persistent_stem_cache.cpp persistent_stem_cache.h
+          git commit -m "Promote tested persistent stem cache v2"
+          git push origin HEAD:main
