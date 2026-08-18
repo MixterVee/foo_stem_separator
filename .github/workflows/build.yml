@@ -1,4 +1,4 @@
-name: Build foobar2000 ONNX stem component
+name: Build stable foobar2000 Stem Separator
 
 on:
   workflow_dispatch:
@@ -45,11 +45,9 @@ jobs:
       - name: Find ATL
         shell: powershell
         run: |
-          $atl = Get-ChildItem "$env:VS2022_PATH\VC\Tools\MSVC" -Filter atlbase.h -Recurse |
-            Select-Object -First 1
+          $atl = Get-ChildItem "$env:VS2022_PATH\VC\Tools\MSVC" -Filter atlbase.h -Recurse | Select-Object -First 1
           if (-not $atl) { throw "atlbase.h not found." }
-          "ATL_INCLUDE=$($atl.Directory.FullName)" |
-            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "ATL_INCLUDE=$($atl.Directory.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install NuGet
         uses: nuget/setup-nuget@v2
@@ -61,8 +59,7 @@ jobs:
           nuget install wtl -Version 10.0.10320 -OutputDirectory $packages -NonInteractive
           $h = Get-ChildItem $packages -Filter atlapp.h -Recurse | Select-Object -First 1
           if (-not $h) { throw "WTL not found." }
-          "WTL_INCLUDE=$($h.Directory.FullName)" |
-            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "WTL_INCLUDE=$($h.Directory.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Get foobar2000 SDK
         shell: powershell
@@ -71,7 +68,20 @@ jobs:
           git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git $sdkRoot
           if (-not (Test-Path $sdkRoot)) { throw "foobar2000 SDK clone failed." }
 
-      - name: Build ONNX component
+      - name: Include backend benchmark source
+        shell: powershell
+        run: |
+          $path = "$env:GITHUB_WORKSPACE\build-ci-v12.ps1"
+          $text = Get-Content $path -Raw
+          $old = '    "stem_waveform_provider.cpp"'
+          if ($text -notmatch 'stem_benchmark\.cpp') {
+            $new = $old + ',' + "`r`n" + '    "stem_benchmark.cpp"'
+            if (-not $text.Contains($old)) { throw "Build source insertion point not found." }
+            $text = $text.Replace($old, $new)
+            Set-Content -Path $path -Value $text -Encoding UTF8
+          }
+
+      - name: Build Stem Separator DLL
         shell: powershell
         run: |
           .\build-ci-v12.ps1 `
@@ -80,30 +90,53 @@ jobs:
             -WtlInclude "$env:WTL_INCLUDE" `
             -AtlInclude "$env:ATL_INCLUDE"
 
-      - name: Set up Python 3.14
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.14'
-
-      - name: Install sherpa-onnx runtime
+      - name: Clone sherpa-onnx and enable configurable DirectML adapter
         shell: powershell
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install sherpa-onnx==1.13.4
+          $src = "$env:RUNNER_TEMP\sherpa-onnx"
+          git clone --depth 1 --branch v1.13.4 https://github.com/k2-fsa/sherpa-onnx.git $src
+          if ($LASTEXITCODE -ne 0) { throw "sherpa-onnx clone failed." }
+          $session = Join-Path $src "sherpa-onnx\csrc\session.cc"
+          $text = Get-Content $session -Raw
+          $pattern = 'int32_t device_id = 0;\r?\n\s*OrtStatus \*status ='
+          $replacement = "int32_t device_id = 0;`n      auto device_it = config.find(`"device_id`");`n      if (device_it != config.end()) {`n        device_id = ToIntOrDefault(device_it->second, 0);`n        config.erase(device_it);`n      }`n      OrtStatus *status ="
+          $matches = [regex]::Matches($text, $pattern).Count
+          if ($matches -ne 1) { throw "Expected one DirectML device-id site; found $matches." }
+          $text = [regex]::Replace($text, $pattern, $replacement, 1)
+          Set-Content -Path $session -Value $text -Encoding UTF8
 
-          $pkg = python -c "import sherpa_onnx, pathlib; print(pathlib.Path(sherpa_onnx.__file__).parent)"
-          Write-Host "sherpa_onnx package: $pkg"
+      - name: Build sherpa-onnx 1.13.4 with DirectML
+        shell: powershell
+        run: |
+          $src = "$env:RUNNER_TEMP\sherpa-onnx"
+          $build = "$env:RUNNER_TEMP\sherpa-directml-build"
+          $install = "$env:RUNNER_TEMP\sherpa-directml-install"
+          cmake -S $src -B $build -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="$install" `
+            -DBUILD_SHARED_LIBS=ON `
+            -DSHERPA_ONNX_ENABLE_DIRECTML=ON `
+            -DSHERPA_ONNX_ENABLE_C_API=ON `
+            -DSHERPA_ONNX_ENABLE_BINARY=OFF `
+            -DSHERPA_ONNX_BUILD_C_API_EXAMPLES=OFF `
+            -DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF `
+            -DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF `
+            -DSHERPA_ONNX_ENABLE_TTS=OFF `
+            -DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=OFF `
+            -DSHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE=OFF
+          if ($LASTEXITCODE -ne 0) { throw "sherpa-onnx configure failed." }
+          cmake --build $build --config Release --target install -- /m:2
+          if ($LASTEXITCODE -ne 0) { throw "sherpa-onnx build failed." }
 
-          $dlls = Get-ChildItem $pkg -Filter *.dll -Recurse
-          if (-not $dlls) { throw "No sherpa-onnx DLLs found." }
-
-          foreach ($dll in $dlls) {
-            Copy-Item $dll.FullName "$env:GITHUB_WORKSPACE\dist\$($dll.Name)" -Force
+          $dist = "$env:GITHUB_WORKSPACE\dist"
+          $dlls = Get-ChildItem $install -Filter *.dll -Recurse
+          if (-not $dlls) { throw "No sherpa runtime DLLs were installed." }
+          foreach ($dll in $dlls) { Copy-Item $dll.FullName "$dist\$($dll.Name)" -Force }
+          foreach ($required in @("sherpa-onnx-c-api.dll", "onnxruntime.dll", "DirectML.dll")) {
+            if (-not (Test-Path "$dist\$required")) { throw "Missing runtime file: $required" }
           }
-
-          $capi = Get-ChildItem "$env:GITHUB_WORKSPACE\dist" -Filter sherpa-onnx-c-api.dll |
-            Select-Object -First 1
-          if (-not $capi) { throw "sherpa-onnx-c-api.dll was not packaged." }
+          Set-Content "$dist\directml-device0.config" "device_id=0" -Encoding ascii
+          Set-Content "$dist\directml-device1.config" "device_id=1" -Encoding ascii
 
       - name: Download Spleeter ONNX models
         shell: powershell
@@ -111,41 +144,36 @@ jobs:
           $archive = "$env:RUNNER_TEMP\spleeter.tar.bz2"
           $extract1 = "$env:RUNNER_TEMP\spleeter-stage1"
           $extract2 = "$env:RUNNER_TEMP\spleeter-stage2"
-
-          Invoke-WebRequest `
-            "https://github.com/k2-fsa/sherpa-onnx/releases/download/source-separation-models/sherpa-onnx-spleeter-2stems-fp16.tar.bz2" `
-            -OutFile $archive
-
+          Invoke-WebRequest "https://github.com/k2-fsa/sherpa-onnx/releases/download/source-separation-models/sherpa-onnx-spleeter-2stems-fp16.tar.bz2" -OutFile $archive
           New-Item -ItemType Directory -Force $extract1,$extract2 | Out-Null
           7z x $archive "-o$extract1" -y
           $tar = Get-ChildItem $extract1 -Filter *.tar | Select-Object -First 1
+          if (-not $tar) { throw "Inner Spleeter tar archive not found." }
           7z x $tar.FullName "-o$extract2" -y
-
-          $vocals = Get-ChildItem $extract2 -Filter vocals.fp16.onnx -Recurse |
-            Select-Object -First 1
-          $accomp = Get-ChildItem $extract2 -Filter accompaniment.fp16.onnx -Recurse |
-            Select-Object -First 1
-
-          if (-not $vocals -or -not $accomp) {
-            throw "Spleeter model files not found."
-          }
-
+          $vocals = Get-ChildItem $extract2 -Filter vocals.fp16.onnx -Recurse | Select-Object -First 1
+          $accomp = Get-ChildItem $extract2 -Filter accompaniment.fp16.onnx -Recurse | Select-Object -First 1
+          if (-not $vocals -or -not $accomp) { throw "Spleeter models not found." }
           $modelDir = "$env:GITHUB_WORKSPACE\dist\models\spleeter"
           New-Item -ItemType Directory -Force $modelDir | Out-Null
           Copy-Item $vocals.FullName "$modelDir\vocals.fp16.onnx" -Force
           Copy-Item $accomp.FullName "$modelDir\accompaniment.fp16.onnx" -Force
 
-      - name: Create fb2k component package
+      - name: Create stable fb2k component package
         shell: powershell
         run: |
           $dist = "$env:GITHUB_WORKSPACE\dist"
+          Set-Content "$dist\BACKENDS.txt" @(
+            "Stem Separator selectable processing backend",
+            "Benchmark: TIME lower is better; SPEED vs CPU higher is better.",
+            "Available choices: CPU, DirectML adapter 0, DirectML adapter 1."
+          ) -Encoding UTF8
           $tempZip = "$env:RUNNER_TEMP\foo_stem_separator.zip"
           Compress-Archive -Path "$dist\*" -DestinationPath $tempZip -Force
           Copy-Item $tempZip "$dist\foo_stem_separator.fb2k-component" -Force
 
-      - name: Upload component
+      - name: Upload stable component
         uses: actions/upload-artifact@v4
         with:
-          name: foo_stem_separator-onnx-v12
+          name: foo_stem_separator-stable
           path: dist/**
           if-no-files-found: error
