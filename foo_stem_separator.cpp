@@ -1,4 +1,4 @@
-#include <foobar2000/SDK/foobar2000.h>
+﻿#include <foobar2000/SDK/foobar2000.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -39,7 +39,7 @@ using Microsoft::WRL::ComPtr;
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "2.4.0 EOF-safe FIFO cache + startup de-click + MP3/WAV export",
+    "2.5.0 Dynamic DirectML GPU backends + benchmark",
     "Native ONNX vocals / instrumental separation.\n"
     "Zero-latency position-cache playback with optional start pre-cache and clean WAV/MP3 export.\n"
     "Live stems use independent read-ahead caching; export uses whole-track Spleeter inference with WAV or 320 kbps MP3 output."
@@ -1032,3 +1032,4 @@ static contextmenu_item_factory_t<
     g_stem_mode_context_menu;
 
 } // namespace
+
