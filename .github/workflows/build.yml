@@ -1,9 +1,11 @@
-name: Build stable foobar2000 Stem Separator
+name: Build Stem Separator cache compression test
 
 on:
-  workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ agent/persistent-cache-compression ]
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -12,6 +14,20 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Record run id for chat handoff
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\deliverables" | Out-Null
+          Set-Content "$env:GITHUB_WORKSPACE\deliverables\cache-compression-run-id.txt" "$env:GITHUB_RUN_ID" -Encoding ascii
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deliverables/cache-compression-run-id.txt
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Record cache compression test run [skip ci]"
+            git push origin HEAD:agent/persistent-cache-compression
+          }
 
       - name: Add Visual Studio 2022 MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -143,24 +159,25 @@ jobs:
           Copy-Item $vocals.FullName "$modelDir\vocals.fp16.onnx" -Force
           Copy-Item $accomp.FullName "$modelDir\accompaniment.fp16.onnx" -Force
 
-      - name: Create stable fb2k component package
+      - name: Create cache compression test package
         shell: powershell
         run: |
           $dist = "$env:GITHUB_WORKSPACE\dist"
-          Set-Content "$dist\BACKENDS.txt" @(
-            "Stem Separator 2.5.0 dynamic DirectML processing backend",
-            "Enumerates every hardware DXGI adapter and benchmarks each DirectML backend.",
-            "GPU preference is saved by hardware identity rather than adapter index.",
-            "Missing or failed preferred GPU falls back to CPU automatically.",
-            "Benchmark: TIME lower is better; SPEED vs CPU higher is better."
+          Set-Content "$dist\CACHE_COMPRESSION_TEST.txt" @(
+            "Persistent cache v2 compression test",
+            "New .ssc blocks use reversible float-bit delta + Windows XPRESS-Huffman.",
+            "Compression is mathematically lossless; no PCM bit-depth reduction is used.",
+            "Legacy v1 raw-float cache blocks remain readable.",
+            "If compression does not reduce a block, v2 stores that block as raw floats.",
+            "Existing 10 GB max / 8 GB LRU cleanup policy remains active."
           ) -Encoding UTF8
           $tempZip = "$env:RUNNER_TEMP\foo_stem_separator.zip"
           Compress-Archive -Path "$dist\*" -DestinationPath $tempZip -Force
           Copy-Item $tempZip "$dist\foo_stem_separator.fb2k-component" -Force
 
-      - name: Upload stable component
+      - name: Upload cache compression test component
         uses: actions/upload-artifact@v4
         with:
-          name: foo_stem_separator-stable
+          name: foo_stem_separator-cache-compression-test
           path: dist/**
           if-no-files-found: error
