@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -30,6 +30,11 @@ unsigned directml_adapter_index(backend value);
 std::vector<directml_adapter_info> enumerate_directml_adapters();
 backend selected_backend();
 void select_backend(backend value);
+void remember_auto_backend(backend fastest);
+void select_auto_backend();
+bool selected_backend_preference_is_auto();
+backend auto_backend();
+std::wstring auto_backend_name();
 std::wstring backend_name(backend value);
 
 struct runtime_status {
@@ -100,4 +105,5 @@ private:
 };
 
 } // namespace onnxstem
+
 

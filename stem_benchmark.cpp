@@ -1,4 +1,4 @@
-#include <foobar2000/SDK/foobar2000.h>
+﻿#include <foobar2000/SDK/foobar2000.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -266,6 +266,11 @@ void show_results_and_select(std::vector<benchmark_result>& results) {
         if (r.ok && (!fastest || r.repeat_ms < fastest->repeat_ms)) fastest = &r;
     }
 
+    // Always refresh Auto's stored winner after a successful benchmark, even if
+    // the user chooses a fixed backend below. Auto only becomes active when the
+    // dedicated Auto / Fastest button is selected.
+    if (fastest) onnxstem::remember_auto_backend(fastest->value);
+
     std::wostringstream text;
     text << L"Test: the same 4-second stereo 44.1 kHz Spleeter block\n\n";
     text << L"TIME: LOWER is better.\n";
@@ -291,11 +296,13 @@ void show_results_and_select(std::vector<benchmark_result>& results) {
         text << L"Fastest repeat result: " << fastest->label << L"\n";
     }
 
-    text << L"\nFirst-use includes model/session setup plus the first stem pass.\n"
+    text << L"\nAuto / Fastest remembers the fastest successful result from this benchmark.\n"
+            L"It does not re-run the benchmark when foobar2000 starts.\n\n"
+            L"First-use includes model/session setup plus the first stem pass.\n"
             L"Repeat best represents ongoing stem and seek processing.\n\n"
             L"GPU selections are saved by hardware identity, not by adapter number.\n"
-            L"If the preferred GPU is missing or DirectML cannot initialize, live stems fall back to CPU.\n\n"
-            L"Choose the backend you prefer below.";
+            L"If Auto's winning GPU is missing or DirectML cannot initialize, live stems fall back to CPU.\n\n"
+            L"Choose Auto / Fastest or a fixed backend below.";
 
     std::vector<std::wstring> button_text;
     std::vector<onnxstem::backend> choices;
@@ -315,16 +322,26 @@ void show_results_and_select(std::vector<benchmark_result>& results) {
         return;
     }
 
+    constexpr int kAutoButton = 900;
+    std::wstring auto_button_text;
     std::vector<TASKDIALOG_BUTTON> buttons;
-    buttons.reserve(choices.size());
+    buttons.reserve(choices.size() + (fastest ? 1u : 0u));
+
     int default_button = 1000;
+    if (fastest) {
+        auto_button_text = L"Auto / Fastest - " + fastest->label;
+        TASKDIALOG_BUTTON auto_button{};
+        auto_button.nButtonID = kAutoButton;
+        auto_button.pszButtonText = auto_button_text.c_str();
+        buttons.push_back(auto_button);
+        default_button = kAutoButton;
+    }
 
     for (size_t i = 0; i < choices.size(); ++i) {
         TASKDIALOG_BUTTON b{};
         b.nButtonID = 1000 + static_cast<int>(i);
         b.pszButtonText = button_text[i].c_str();
         buttons.push_back(b);
-        if (fastest && choices[i] == fastest->value) default_button = b.nButtonID;
     }
 
     TASKDIALOGCONFIG config{};
@@ -349,6 +366,23 @@ void show_results_and_select(std::vector<benchmark_result>& results) {
         return;
     }
 
+    if (pressed == kAutoButton && fastest) {
+        onnxstem::select_auto_backend();
+
+        std::wstring confirmation =
+            L"Selected processing backend:\n\nAuto / Fastest\n\nCurrent benchmark winner:\n" +
+            fastest->label +
+            L"\n\nThe winner is stored by hardware identity. Auto will use this backend on future "
+            L"separation calls without re-running the benchmark. CPU fallback remains automatic "
+            L"if the winning GPU is missing or DirectML cannot initialize.";
+
+        MessageBoxW(
+            core_api::get_main_window(), confirmation.c_str(),
+            L"Stem Separator", MB_OK | MB_ICONINFORMATION);
+        console::print("Stem Separator backend selection updated to Auto / Fastest.");
+        return;
+    }
+
     const int choice_index = pressed - 1000;
     if (choice_index < 0 ||
         static_cast<size_t>(choice_index) >= choices.size()) return;
@@ -357,7 +391,7 @@ void show_results_and_select(std::vector<benchmark_result>& results) {
     onnxstem::select_backend(selected);
 
     std::wstring confirmation =
-        L"Selected processing backend:\n\n" + onnxstem::backend_name(selected) +
+        L"Selected fixed processing backend:\n\n" + onnxstem::backend_name(selected) +
         L"\n\nThe GPU preference is stored by hardware identity. "
         L"The live cache and exports will use it on their next separation call. "
         L"CPU fallback remains automatic if that GPU is unavailable.";
@@ -366,9 +400,8 @@ void show_results_and_select(std::vector<benchmark_result>& results) {
         core_api::get_main_window(), confirmation.c_str(),
         L"Stem Separator", MB_OK | MB_ICONINFORMATION);
 
-    console::print("Stem Separator backend selection updated.");
+    console::print("Stem Separator fixed backend selection updated.");
 }
-
 void benchmark_thread(std::wstring source) {
     std::vector<float> clip;
     std::wstring error;
@@ -464,3 +497,4 @@ static contextmenu_item_factory_t<stem_backend_benchmark_context_menu>
     g_stem_backend_benchmark_context_menu;
 
 } // namespace
+

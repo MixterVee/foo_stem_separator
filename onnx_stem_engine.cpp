@@ -1,4 +1,4 @@
-#include <foobar2000/SDK/foobar2000.h>
+﻿#include <foobar2000/SDK/foobar2000.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -98,6 +98,29 @@ cfg_int g_backend_subsys_cfg(g_backend_subsys_guid, 0);
 cfg_int g_backend_revision_cfg(g_backend_revision_guid, 0);
 cfg_int g_backend_ordinal_cfg(g_backend_ordinal_guid, 0);
 
+// Auto / Fastest stores the latest successful benchmark winner separately from
+// the user's manual CPU/GPU preference. This lets a benchmark refresh Auto's
+// winner without changing a manually selected backend.
+static const GUID g_auto_kind_guid =
+    {0x676c1ff0,0x3772,0x4cad,{0xb1,0x10,0xf7,0x6b,0x44,0xe8,0xf0,0x11}};
+static const GUID g_auto_vendor_guid =
+    {0x676c1ff1,0x3772,0x4cad,{0xb1,0x10,0xf7,0x6b,0x44,0xe8,0xf0,0x11}};
+static const GUID g_auto_device_guid =
+    {0x676c1ff2,0x3772,0x4cad,{0xb1,0x10,0xf7,0x6b,0x44,0xe8,0xf0,0x11}};
+static const GUID g_auto_subsys_guid =
+    {0x676c1ff3,0x3772,0x4cad,{0xb1,0x10,0xf7,0x6b,0x44,0xe8,0xf0,0x11}};
+static const GUID g_auto_revision_guid =
+    {0x676c1ff4,0x3772,0x4cad,{0xb1,0x10,0xf7,0x6b,0x44,0xe8,0xf0,0x11}};
+static const GUID g_auto_ordinal_guid =
+    {0x676c1ff5,0x3772,0x4cad,{0xb1,0x10,0xf7,0x6b,0x44,0xe8,0xf0,0x11}};
+
+cfg_int g_auto_kind_cfg(g_auto_kind_guid, -1); // -1 none, 0 CPU, 1 DirectML
+cfg_int g_auto_vendor_cfg(g_auto_vendor_guid, 0);
+cfg_int g_auto_device_cfg(g_auto_device_guid, 0);
+cfg_int g_auto_subsys_cfg(g_auto_subsys_guid, 0);
+cfg_int g_auto_revision_cfg(g_auto_revision_guid, 0);
+cfg_int g_auto_ordinal_cfg(g_auto_ordinal_guid, 0);
+
 std::mutex g_runtime_status_mutex;
 onnxstem::runtime_status g_runtime_status;
 std::atomic<unsigned> g_runtime_processing_count{0};
@@ -189,6 +212,46 @@ bool matches_saved_hardware(const onnxstem::directml_adapter_info& a) {
         a.duplicate_ordinal == static_cast<uint32_t>(g_backend_ordinal_cfg.get());
 }
 
+bool matches_saved_auto_hardware(const onnxstem::directml_adapter_info& a) {
+    return a.vendor_id == static_cast<uint32_t>(g_auto_vendor_cfg.get()) &&
+        a.device_id == static_cast<uint32_t>(g_auto_device_cfg.get()) &&
+        a.subsys_id == static_cast<uint32_t>(g_auto_subsys_cfg.get()) &&
+        a.revision == static_cast<uint32_t>(g_auto_revision_cfg.get()) &&
+        a.duplicate_ordinal == static_cast<uint32_t>(g_auto_ordinal_cfg.get());
+}
+
+onnxstem::backend resolve_auto_backend(
+    const std::vector<onnxstem::directml_adapter_info>& adapters) {
+
+    const int kind = static_cast<int>(g_auto_kind_cfg.get());
+    if (kind == 0) return onnxstem::backend::cpu;
+
+    if (kind == 1) {
+        for (const auto& a : adapters) {
+            if (matches_saved_auto_hardware(a)) {
+                return onnxstem::directml_backend(a.index);
+            }
+        }
+    }
+
+    // No benchmark winner yet, or the benchmark-winning GPU is missing.
+    // Auto remains selected but resolves safely to CPU until a valid winner
+    // is available again.
+    return onnxstem::backend::cpu;
+}
+
+void save_auto_cpu_winner() {
+    g_auto_kind_cfg = 0;
+}
+
+void save_auto_gpu_winner(const onnxstem::directml_adapter_info& a) {
+    g_auto_kind_cfg = 1;
+    g_auto_vendor_cfg = static_cast<int32_t>(a.vendor_id);
+    g_auto_device_cfg = static_cast<int32_t>(a.device_id);
+    g_auto_subsys_cfg = static_cast<int32_t>(a.subsys_id);
+    g_auto_revision_cfg = static_cast<int32_t>(a.revision);
+    g_auto_ordinal_cfg = static_cast<int32_t>(a.duplicate_ordinal);
+}
 void save_cpu_selection() {
     g_backend_kind_cfg = 0;
     g_backend_cfg = 0;
@@ -273,6 +336,10 @@ backend selected_backend() {
         return backend::cpu;
     }
 
+    if (kind == 2) {
+        return resolve_auto_backend(adapters);
+    }
+
     // One-time migration from the original index-based selector.
     const int old = static_cast<int>(g_backend_cfg.get());
     if (old <= 0) {
@@ -311,6 +378,39 @@ void select_backend(backend value) {
     }
 }
 
+void remember_auto_backend(backend fastest) {
+    if (fastest == backend::cpu) {
+        save_auto_cpu_winner();
+        return;
+    }
+
+    if (!is_directml_backend(fastest)) return;
+    const unsigned wanted = directml_adapter_index(fastest);
+    for (const auto& a : enumerate_directml_adapters()) {
+        if (a.index == wanted) {
+            save_auto_gpu_winner(a);
+            return;
+        }
+    }
+}
+
+void select_auto_backend() {
+    // Kind 2 means resolve the separately stored benchmark winner each time.
+    // If no winner exists yet, Auto safely resolves to CPU.
+    g_backend_kind_cfg = 2;
+}
+
+bool selected_backend_preference_is_auto() {
+    return static_cast<int>(g_backend_kind_cfg.get()) == 2;
+}
+
+backend auto_backend() {
+    return resolve_auto_backend(enumerate_directml_adapters());
+}
+
+std::wstring auto_backend_name() {
+    return backend_name(auto_backend());
+}
 std::wstring backend_name(backend value) {
     if (value == backend::selected) value = selected_backend();
     if (value == backend::cpu) return L"CPU";
@@ -339,7 +439,8 @@ runtime_status current_runtime_status() {
 }
 
 bool selected_backend_preference_is_gpu() {
-    return static_cast<int>(g_backend_kind_cfg.get()) == 1;
+    const int kind = static_cast<int>(g_backend_kind_cfg.get());
+    return kind == 1 || (kind == 2 && static_cast<int>(g_auto_kind_cfg.get()) == 1);
 }
 
 struct engine::api {
@@ -630,4 +731,5 @@ bool engine::process_both(
 }
 
 } // namespace onnxstem
+
 
