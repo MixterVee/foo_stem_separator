@@ -1,0 +1,55 @@
+name: Promote tested stem status source
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ agent/stem-status-overlay ]
+    paths:
+      - '.github/workflows/promote-status-source.yml'
+      - 'promote-status-source-trigger.txt'
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Materialize tested status patch
+        shell: pwsh
+        run: |
+          $workflow = Get-Content '.github/workflows/build.yml'
+          $nameIndex = -1
+          for ($i = 0; $i -lt $workflow.Count; ++$i) {
+            if ($workflow[$i] -eq '      - name: Patch live processing status service') { $nameIndex = $i; break }
+          }
+          if ($nameIndex -lt 0) { throw 'Status patch step not found.' }
+          $runIndex = -1
+          for ($i = $nameIndex + 1; $i -lt $workflow.Count; ++$i) {
+            if ($workflow[$i] -eq '        run: |') { $runIndex = $i; break }
+          }
+          if ($runIndex -lt 0) { throw 'Status patch run block not found.' }
+          $script = New-Object System.Collections.Generic.List[string]
+          for ($i = $runIndex + 1; $i -lt $workflow.Count; ++$i) {
+            $line = $workflow[$i]
+            if ($line -match '^      - name: ') { break }
+            if ($line.StartsWith('          ')) { $script.Add($line.Substring(10)) }
+            elseif ($line.Trim().Length -eq 0) { $script.Add('') }
+            else { throw "Unexpected indentation: $line" }
+          }
+          Set-Content "$env:RUNNER_TEMP\materialize-status.ps1" $script -Encoding UTF8
+          & "$env:RUNNER_TEMP\materialize-status.ps1"
+
+      - name: Commit tested status implementation
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add build-ci-v12.ps1 onnx_stem_engine.h onnx_stem_engine.cpp stem_dsp.cpp stem_processing_status_service.h
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m 'Make processing status service permanent [skip ci]'
+            git push origin HEAD:agent/stem-status-overlay
+          }
