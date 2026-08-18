@@ -7,7 +7,7 @@ namespace onnxstem {
 
 // Runtime-selectable processing backend used by live stems, exports, and the benchmark.
 // The benchmark compares the same audio block on every available backend.
-// Backend selection is persisted in foobar2000 configuration.
+// Backend selection is persisted in foobar2000 configuration and can change at runtime.
 enum class backend : int {
     selected = -1,
     cpu = 0,
