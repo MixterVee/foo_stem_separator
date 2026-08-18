@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory=$true)]
     [string]$SdkRoot,
 
@@ -32,6 +32,7 @@ $cppFiles = @(
     "foo_stem_separator.cpp",
     "stem_mode.cpp",
     "onnx_stem_engine.cpp",
+    "persistent_stem_cache.cpp",
     "stem_dsp.cpp",
     "stem_waveform_provider.cpp",
     "stem_benchmark.cpp"
@@ -40,6 +41,7 @@ $cppFiles = @(
 $hFiles = @(
     "stem_mode.h",
     "onnx_stem_engine.h",
+    "persistent_stem_cache.h",
     "stem_waveform_provider.h",
     "stem_transport_service.h",
     "stem_processing_status_service.h"
@@ -180,4 +182,5 @@ finally {
         Remove-Item $backup -Force
     }
 }
+
 
