@@ -13,9 +13,11 @@
 #include "onnx_stem_engine.h"
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -95,6 +97,35 @@ cfg_int g_backend_device_cfg(g_backend_device_guid, 0);
 cfg_int g_backend_subsys_cfg(g_backend_subsys_guid, 0);
 cfg_int g_backend_revision_cfg(g_backend_revision_guid, 0);
 cfg_int g_backend_ordinal_cfg(g_backend_ordinal_guid, 0);
+
+std::mutex g_runtime_status_mutex;
+onnxstem::runtime_status g_runtime_status;
+std::atomic<unsigned> g_runtime_processing_count{0};
+
+void publish_runtime_status(onnxstem::backend active, bool ready, bool fallback) {
+    onnxstem::runtime_status next;
+    next.active_backend = active;
+    next.engine_ready = ready;
+    next.using_fallback = fallback;
+    next.processing = g_runtime_processing_count.load(std::memory_order_relaxed) != 0;
+    if (ready && active != onnxstem::backend::selected) {
+        next.backend_label = onnxstem::backend_name(active);
+    }
+    std::lock_guard<std::mutex> lock(g_runtime_status_mutex);
+    g_runtime_status = std::move(next);
+}
+
+class runtime_processing_scope {
+public:
+    explicit runtime_processing_scope(bool report) : m_report(report) {
+        if (m_report) g_runtime_processing_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~runtime_processing_scope() {
+        if (m_report) g_runtime_processing_count.fetch_sub(1, std::memory_order_relaxed);
+    }
+private:
+    bool m_report = false;
+};
 
 std::wstring utf8_to_wide(const char* s) {
     if (!s || !*s) return {};
@@ -300,6 +331,17 @@ std::wstring backend_name(backend value) {
     return s.str();
 }
 
+runtime_status current_runtime_status() {
+    std::lock_guard<std::mutex> lock(g_runtime_status_mutex);
+    runtime_status out = g_runtime_status;
+    out.processing = g_runtime_processing_count.load(std::memory_order_relaxed) != 0;
+    return out;
+}
+
+bool selected_backend_preference_is_gpu() {
+    return static_cast<int>(g_backend_kind_cfg.get()) == 1;
+}
+
 struct engine::api {
     CreateFn create = nullptr;
     DestroyFn destroy = nullptr;
@@ -396,7 +438,13 @@ bool engine::initialize() {
     if (m_attempted) return false;
     m_attempted = true;
 
-    if (initialize_backend(wanted)) return true;
+    if (initialize_backend(wanted)) {
+        if (m_requested_backend == backend::selected) {
+            const bool fallback = wanted == backend::cpu && selected_backend_preference_is_gpu();
+            publish_runtime_status(m_active_backend, true, fallback);
+        }
+        return true;
+    }
 
     if (m_requested_backend == backend::selected && is_directml_backend(wanted)) {
         const std::wstring gpu_error = m_error;
@@ -404,6 +452,7 @@ bool engine::initialize() {
         m_error.clear();
 
         if (initialize_backend(backend::cpu)) {
+            publish_runtime_status(m_active_backend, true, true);
             pfc::string_formatter msg;
             msg << "Stem Separator: preferred DirectML backend failed; using CPU fallback for this session.";
             console::print(msg);
@@ -546,6 +595,8 @@ bool engine::process_both(
 
     if (!initialize()) return false;
 
+    runtime_processing_scope processing(m_requested_backend == backend::selected);
+
     std::vector<float> left(frames);
     std::vector<float> right(frames);
     for (size_t i = 0; i < frames; ++i) {
@@ -579,3 +630,4 @@ bool engine::process_both(
 }
 
 } // namespace onnxstem
+

@@ -33,6 +33,7 @@
 #include "onnx_stem_engine.h"
 #include "stem_mode.h"
 #include "stem_transport_service.h"
+#include "stem_processing_status_service.h"
 
 namespace stem_precache {
 bool enabled();
@@ -50,6 +51,9 @@ using Microsoft::WRL::ComPtr;
 #define FOOGUIDDECL
 FOOGUIDDECL const GUID stem_transport_service::class_guid =
 { 0x3f42b0c7, 0x8df1, 0x4fb9, { 0xa6, 0x7d, 0x21, 0x55, 0x91, 0xc8, 0x43, 0x6e } };
+
+FOOGUIDDECL const GUID stem_processing_status_service::class_guid =
+{ 0x7a9c0b21, 0x10c5, 0x4d31, { 0xa9, 0x2e, 0x64, 0x1b, 0x2f, 0x8c, 0x51, 0x73 } };
 
 namespace {
 
@@ -2485,6 +2489,35 @@ public:
 static service_factory_single_t<stem_transport_service_impl>
     g_stem_transport_service_factory;
 
+class stem_processing_status_service_impl : public stem_processing_status_service {
+public:
+    bool get_status(stem_processing_status& out) override {
+        try {
+            out = stem_processing_status{};
+            out.mode = static_cast<int>(stemmode::get());
+            const auto runtime = onnxstem::current_runtime_status();
+            out.engine_ready = runtime.engine_ready ? 1 : 0;
+            out.processing = runtime.processing ? 1 : 0;
+            out.cpu_fallback = runtime.using_fallback ? 1 : 0;
+            if (runtime.active_backend == onnxstem::backend::cpu) {
+                out.backend_type = stem_processing_backend_cpu;
+            } else if (onnxstem::is_directml_backend(runtime.active_backend)) {
+                out.backend_type = stem_processing_backend_directml;
+                out.adapter_index = onnxstem::directml_adapter_index(runtime.active_backend);
+            }
+            if (!runtime.backend_label.empty()) {
+                wcsncpy_s(out.backend_label, _countof(out.backend_label), runtime.backend_label.c_str(), _TRUNCATE);
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+};
+
+static service_factory_single_t<stem_processing_status_service_impl>
+    g_stem_processing_status_service_factory;
+
 class stem_playback_observer :
     public play_callback_static {
 public:
@@ -3205,3 +3238,4 @@ static dsp_factory_t<stem_dsp>
     g_stem_dsp_factory;
 
 } // namespace
+
