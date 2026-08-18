@@ -4,6 +4,16 @@ on:
   workflow_dispatch:
   push:
     branches: [ agent/dynamic-directml-adapters ]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'build-ci-v12.ps1'
+      - 'onnx_stem_engine.cpp'
+      - 'onnx_stem_engine.h'
+      - 'stem_benchmark.cpp'
+
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   build:
@@ -12,6 +22,20 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Record run id for chat handoff
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\deliverables" | Out-Null
+          Set-Content "$env:GITHUB_WORKSPACE\deliverables\dynamic-adapters-run-id.txt" "$env:GITHUB_RUN_ID" -Encoding ascii
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deliverables/dynamic-adapters-run-id.txt
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Record dynamic adapter test run id"
+            git push origin HEAD:agent/dynamic-directml-adapters
+          }
 
       - name: Add Visual Studio 2022 MSBuild
         uses: microsoft/setup-msbuild@v2
