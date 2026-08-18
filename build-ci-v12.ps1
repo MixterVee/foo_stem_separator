@@ -1,4 +1,4 @@
-﻿param(
+param(
     [Parameter(Mandatory=$true)]
     [string]$SdkRoot,
 
@@ -17,16 +17,6 @@ $ErrorActionPreference = "Stop"
 Write-Host "==============================================="
 Write-Host "V12 - NATIVE ONNX DSP PROTOTYPE"
 Write-Host "==============================================="
-
-# Stable persistent-cache integration. The accepted v2 behavior is kept in the
-# exact tested patch so CI applies the same source transformation before build.
-$cachePatch = Join-Path $RepoRoot "patch-persistent-cache.py"
-if (Test-Path $cachePatch) {
-    python $cachePatch
-    if ($LASTEXITCODE -ne 0) {
-        throw "Persistent cache v2 source patch failed."
-    }
-}
 
 $sampleProject = Get-ChildItem -Path $SdkRoot -Filter "foo_sample.vcxproj" -Recurse |
     Select-Object -First 1
@@ -192,4 +182,3 @@ finally {
         Remove-Item $backup -Force
     }
 }
-
