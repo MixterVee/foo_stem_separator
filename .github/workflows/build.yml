@@ -1,9 +1,19 @@
-name: Build stable foobar2000 Stem Separator
+name: Build Stem Separator persistent cache test
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ agent/persistent-stem-cache ]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'patch-persistent-cache.py'
+      - 'persistent_stem_cache.cpp'
+      - 'persistent_stem_cache.h'
+      - 'persistent-cache-trigger.txt'
+
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   build:
@@ -12,6 +22,40 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Record run id for chat handoff
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\deliverables" | Out-Null
+          Set-Content "$env:GITHUB_WORKSPACE\deliverables\persistent-cache-run-id.txt" "$env:GITHUB_RUN_ID" -Encoding ascii
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deliverables/persistent-cache-run-id.txt
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Record persistent cache test run [skip ci]"
+            git push origin HEAD:agent/persistent-stem-cache
+          }
+
+      - name: Apply persistent cache integration
+        shell: powershell
+        run: |
+          python .\patch-persistent-cache.py
+          if ($LASTEXITCODE -ne 0) { throw "Persistent cache patch failed." }
+
+          $buildScript = "build-ci-v12.ps1"
+          $text = Get-Content $buildScript -Raw
+          $text = $text.Replace(
+            '    "onnx_stem_engine.cpp",',
+            "    `"onnx_stem_engine.cpp`",`r`n    `"persistent_stem_cache.cpp`",")
+          $text = $text.Replace(
+            '    "onnx_stem_engine.h",',
+            "    `"onnx_stem_engine.h`",`r`n    `"persistent_stem_cache.h`",")
+          if ($text -notmatch 'persistent_stem_cache\.cpp' -or
+              $text -notmatch 'persistent_stem_cache\.h') {
+            throw "Could not add persistent cache sources to build-ci-v12.ps1"
+          }
+          Set-Content $buildScript $text -Encoding UTF8
 
       - name: Add Visual Studio 2022 MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -143,24 +187,23 @@ jobs:
           Copy-Item $vocals.FullName "$modelDir\vocals.fp16.onnx" -Force
           Copy-Item $accomp.FullName "$modelDir\accompaniment.fp16.onnx" -Force
 
-      - name: Create stable fb2k component package
+      - name: Create persistent cache test package
         shell: powershell
         run: |
           $dist = "$env:GITHUB_WORKSPACE\dist"
-          Set-Content "$dist\BACKENDS.txt" @(
-            "Stem Separator 2.5.0 dynamic DirectML processing backend",
-            "Enumerates every hardware DXGI adapter and benchmarks each DirectML backend.",
-            "GPU preference is saved by hardware identity rather than adapter index.",
-            "Missing or failed preferred GPU falls back to CPU automatically.",
-            "Benchmark: TIME lower is better; SPEED vs CPU higher is better."
+          Set-Content "$dist\PERSISTENT_CACHE_TEST.txt" @(
+            "Stem Separator persistent stem cache test",
+            "Separated Vocals + Instrumental blocks are stored under LOCALAPPDATA\\foobar2000\\StemSeparatorCache\\v1.",
+            "Cache validity is tied to source path, file size, and last-write timestamp.",
+            "Original PCM is not persisted; it remains decoder-backed."
           ) -Encoding UTF8
           $tempZip = "$env:RUNNER_TEMP\foo_stem_separator.zip"
           Compress-Archive -Path "$dist\*" -DestinationPath $tempZip -Force
           Copy-Item $tempZip "$dist\foo_stem_separator.fb2k-component" -Force
 
-      - name: Upload stable component
+      - name: Upload persistent cache test component
         uses: actions/upload-artifact@v4
         with:
-          name: foo_stem_separator-stable
+          name: foo_stem_separator-persistent-cache
           path: dist/**
           if-no-files-found: error
