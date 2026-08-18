@@ -5,6 +5,7 @@
 
 namespace onnxstem {
 
+// Runtime-selectable processing backend used by live stems, exports, and the benchmark.
 enum class backend : int {
     selected = -1,
     cpu = 0,
