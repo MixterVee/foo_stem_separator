@@ -9,7 +9,6 @@
 
 #include <windows.h>
 #include <commctrl.h>
-#include <dxgi1_2.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -28,7 +27,6 @@
 #include "onnx_stem_engine.h"
 
 #pragma comment(lib, "comctl32.lib")
-#pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
@@ -102,9 +100,7 @@ bool decode_benchmark_clip(
     if (!guard.start(error)) return false;
 
     ComPtr<IMFSourceReader> reader;
-    HRESULT hr = MFCreateSourceReaderFromURL(
-        source.c_str(), nullptr, &reader);
-
+    HRESULT hr = MFCreateSourceReaderFromURL(source.c_str(), nullptr, &reader);
     if (FAILED(hr)) {
         error = L"Windows could not open the selected audio file.";
         return false;
@@ -126,10 +122,7 @@ bool decode_benchmark_clip(
     type->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, kRate * 8);
 
     hr = reader->SetCurrentMediaType(
-        MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-        nullptr,
-        type.Get());
-
+        MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, type.Get());
     if (FAILED(hr)) {
         error = L"Windows could not convert this track to stereo 44.1 kHz float audio.";
         return false;
@@ -150,29 +143,22 @@ bool decode_benchmark_clip(
 
         hr = reader->ReadSample(
             MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-            0,
-            &stream_index,
-            &flags,
-            &timestamp,
-            &sample);
+            0, &stream_index, &flags, &timestamp, &sample);
 
         if (FAILED(hr)) {
             error = L"Error while decoding the benchmark clip.";
             return false;
         }
-
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
         if (!sample) continue;
 
         ComPtr<IMFMediaBuffer> buffer;
-        hr = sample->ConvertToContiguousBuffer(&buffer);
-        if (FAILED(hr)) continue;
+        if (FAILED(sample->ConvertToContiguousBuffer(&buffer))) continue;
 
         BYTE* bytes = nullptr;
         DWORD max_length = 0;
         DWORD current_length = 0;
-        hr = buffer->Lock(&bytes, &max_length, &current_length);
-        if (FAILED(hr)) continue;
+        if (FAILED(buffer->Lock(&bytes, &max_length, &current_length))) continue;
 
         const float* src = reinterpret_cast<const float*>(bytes);
         const size_t count = current_length / sizeof(float);
@@ -182,27 +168,12 @@ bool decode_benchmark_clip(
         buffer->Unlock();
     }
 
-    // Keep channel pairs intact.
     if (audio.size() & 1u) audio.pop_back();
-
     if (audio.size() < static_cast<size_t>(kRate) * kChannels) {
         error = L"The selected track is too short for a useful benchmark.";
         return false;
     }
-
     return true;
-}
-
-std::wstring dxgi_adapter_name(unsigned index) {
-    ComPtr<IDXGIFactory1> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return {};
-
-    ComPtr<IDXGIAdapter1> adapter;
-    if (FAILED(factory->EnumAdapters1(index, &adapter))) return {};
-
-    DXGI_ADAPTER_DESC1 desc{};
-    if (FAILED(adapter->GetDesc1(&desc))) return {};
-    return desc.Description;
 }
 
 struct benchmark_result {
@@ -220,6 +191,13 @@ double elapsed_ms(
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
+std::wstring adapter_label(const onnxstem::directml_adapter_info& a) {
+    std::wostringstream s;
+    s << L"DirectML adapter " << a.index;
+    if (!a.name.empty()) s << L" - " << a.name;
+    return s.str();
+}
+
 benchmark_result run_one(
     onnxstem::backend value,
     const std::wstring& label,
@@ -232,7 +210,6 @@ benchmark_result run_one(
     const size_t frames = clip.size() / kChannels;
     std::vector<float> vocals;
     std::vector<float> instrumental;
-
     onnxstem::engine engine(value);
 
     const auto init_begin = std::chrono::steady_clock::now();
@@ -244,8 +221,7 @@ benchmark_result run_one(
 
     const auto first_begin = std::chrono::steady_clock::now();
     if (!engine.process_both(
-            clip.data(), frames, kChannels, kRate,
-            vocals, instrumental)) {
+            clip.data(), frames, kChannels, kRate, vocals, instrumental)) {
         out.error = engine.last_error();
         return out;
     }
@@ -256,15 +232,13 @@ benchmark_result run_one(
 
     const auto repeat_begin = std::chrono::steady_clock::now();
     if (!engine.process_both(
-            clip.data(), frames, kChannels, kRate,
-            vocals, instrumental)) {
+            clip.data(), frames, kChannels, kRate, vocals, instrumental)) {
         out.error = engine.last_error();
         return out;
     }
     const auto repeat_end = std::chrono::steady_clock::now();
 
-    out.first_use_ms =
-        elapsed_ms(init_begin, init_end) +
+    out.first_use_ms = elapsed_ms(init_begin, init_end) +
         elapsed_ms(first_begin, first_end);
     out.repeat_ms = elapsed_ms(repeat_begin, repeat_end);
     out.ok = true;
@@ -280,14 +254,6 @@ std::wstring format_seconds(double ms) {
 std::wstring format_speedup(double speedup) {
     std::wostringstream s;
     s << std::fixed << std::setprecision(2) << speedup << L"x";
-    return s.str();
-}
-
-std::wstring make_adapter_label(unsigned index) {
-    const std::wstring name = dxgi_adapter_name(index);
-    std::wostringstream s;
-    s << L"DirectML adapter " << index;
-    if (!name.empty()) s << L" - " << name;
     return s.str();
 }
 
@@ -314,11 +280,9 @@ void show_results_and_select(std::vector<benchmark_result>& results) {
 
         text << L"  First-use: " << format_seconds(r.first_use_ms) << L"\n";
         text << L"  Repeat:    " << format_seconds(r.repeat_ms) << L"\n";
-
-        if (cpu && cpu->repeat_ms > 0.0) {
+        if (cpu && cpu->repeat_ms > 0.0 && r.repeat_ms > 0.0) {
             text << L"  Speed vs CPU: "
-                 << format_speedup(cpu->repeat_ms / r.repeat_ms)
-                 << L"\n";
+                 << format_speedup(cpu->repeat_ms / r.repeat_ms) << L"\n";
         }
         text << L"\n";
     }
@@ -328,23 +292,39 @@ void show_results_and_select(std::vector<benchmark_result>& results) {
     }
 
     text << L"\nFirst-use includes model/session setup plus the first stem pass.\n"
-            L"Repeat best represents ongoing stem and seek processing.\n"
+            L"Repeat best represents ongoing stem and seek processing.\n\n"
+            L"GPU selections are saved by hardware identity, not by adapter number.\n"
+            L"If the preferred GPU is missing or DirectML cannot initialize, live stems fall back to CPU.\n\n"
             L"Choose the backend you prefer below.";
 
-    std::wstring cpu_button = L"CPU";
-    std::wstring adapter0_button = make_adapter_label(0);
-    std::wstring adapter1_button = make_adapter_label(1);
+    std::vector<std::wstring> button_text;
+    std::vector<onnxstem::backend> choices;
+    button_text.reserve(results.size());
+    choices.reserve(results.size());
 
-    TASKDIALOG_BUTTON buttons[3] = {
-        {100, cpu_button.c_str()},
-        {101, adapter0_button.c_str()},
-        {102, adapter1_button.c_str()}
-    };
+    for (const auto& r : results) {
+        if (!r.ok) continue;
+        button_text.push_back(r.label);
+        choices.push_back(r.value);
+    }
 
-    int default_button = 100;
-    if (fastest) {
-        if (fastest->value == onnxstem::backend::directml_adapter0) default_button = 101;
-        if (fastest->value == onnxstem::backend::directml_adapter1) default_button = 102;
+    if (choices.empty()) {
+        MessageBoxW(
+            core_api::get_main_window(), text.str().c_str(),
+            L"Stem Separator Benchmark", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    std::vector<TASKDIALOG_BUTTON> buttons;
+    buttons.reserve(choices.size());
+    int default_button = 1000;
+
+    for (size_t i = 0; i < choices.size(); ++i) {
+        TASKDIALOG_BUTTON b{};
+        b.nButtonID = 1000 + static_cast<int>(i);
+        b.pszButtonText = button_text[i].c_str();
+        buttons.push_back(b);
+        if (fastest && choices[i] == fastest->value) default_button = b.nButtonID;
     }
 
     TASKDIALOGCONFIG config{};
@@ -356,64 +336,37 @@ void show_results_and_select(std::vector<benchmark_result>& results) {
     config.pszMainInstruction = L"Benchmark complete - lower processing time is better";
     const std::wstring content = text.str();
     config.pszContent = content.c_str();
-    config.cButtons = 3;
-    config.pButtons = buttons;
+    config.cButtons = static_cast<UINT>(buttons.size());
+    config.pButtons = buttons.data();
     config.nDefaultButton = default_button;
 
     int pressed = 0;
-    const HRESULT hr = TaskDialogIndirect(
-        &config, &pressed, nullptr, nullptr);
-
+    const HRESULT hr = TaskDialogIndirect(&config, &pressed, nullptr, nullptr);
     if (FAILED(hr)) {
         MessageBoxW(
-            core_api::get_main_window(),
-            content.c_str(),
-            L"Stem Separator Benchmark",
-            MB_OK | MB_ICONINFORMATION);
+            core_api::get_main_window(), content.c_str(),
+            L"Stem Separator Benchmark", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
-    onnxstem::backend selected = onnxstem::backend::selected;
-    if (pressed == 100) selected = onnxstem::backend::cpu;
-    if (pressed == 101) selected = onnxstem::backend::directml_adapter0;
-    if (pressed == 102) selected = onnxstem::backend::directml_adapter1;
+    const int choice_index = pressed - 1000;
+    if (choice_index < 0 ||
+        static_cast<size_t>(choice_index) >= choices.size()) return;
 
-    if (selected == onnxstem::backend::selected) return;
-
-    // Do not save a backend that failed its benchmark pass.
-    bool selected_ok = false;
-    for (const auto& r : results) {
-        if (r.value == selected) {
-            selected_ok = r.ok;
-            break;
-        }
-    }
-
-    if (!selected_ok) {
-        MessageBoxW(
-            core_api::get_main_window(),
-            L"That backend failed the benchmark and was not selected.",
-            L"Stem Separator Benchmark",
-            MB_OK | MB_ICONWARNING);
-        return;
-    }
-
+    const onnxstem::backend selected = choices[static_cast<size_t>(choice_index)];
     onnxstem::select_backend(selected);
 
     std::wstring confirmation =
-        L"Selected processing backend:\n\n" +
-        std::wstring(onnxstem::backend_name(selected)) +
-        L"\n\nThe live cache and exports will use this backend on their next separation call.";
+        L"Selected processing backend:\n\n" + onnxstem::backend_name(selected) +
+        L"\n\nThe GPU preference is stored by hardware identity. "
+        L"The live cache and exports will use it on their next separation call. "
+        L"CPU fallback remains automatic if that GPU is unavailable.";
 
     MessageBoxW(
-        core_api::get_main_window(),
-        confirmation.c_str(),
-        L"Stem Separator",
-        MB_OK | MB_ICONINFORMATION);
+        core_api::get_main_window(), confirmation.c_str(),
+        L"Stem Separator", MB_OK | MB_ICONINFORMATION);
 
-    pfc::string_formatter msg;
-    msg << "Stem Separator backend selection updated.";
-    console::print(msg);
+    console::print("Stem Separator backend selection updated.");
 }
 
 void benchmark_thread(std::wstring source) {
@@ -422,30 +375,20 @@ void benchmark_thread(std::wstring source) {
 
     if (!decode_benchmark_clip(source, clip, error)) {
         MessageBoxW(
-            core_api::get_main_window(),
-            error.c_str(),
-            L"Stem Separator Benchmark",
-            MB_OK | MB_ICONERROR);
+            core_api::get_main_window(), error.c_str(),
+            L"Stem Separator Benchmark", MB_OK | MB_ICONERROR);
         return;
     }
 
+    const auto adapters = onnxstem::enumerate_directml_adapters();
     std::vector<benchmark_result> results;
-    results.reserve(3);
+    results.reserve(1 + adapters.size());
 
-    results.push_back(run_one(
-        onnxstem::backend::cpu,
-        L"CPU",
-        clip));
-
-    results.push_back(run_one(
-        onnxstem::backend::directml_adapter0,
-        make_adapter_label(0),
-        clip));
-
-    results.push_back(run_one(
-        onnxstem::backend::directml_adapter1,
-        make_adapter_label(1),
-        clip));
+    results.push_back(run_one(onnxstem::backend::cpu, L"CPU", clip));
+    for (const auto& a : adapters) {
+        results.push_back(run_one(
+            onnxstem::directml_backend(a.index), adapter_label(a), clip));
+    }
 
     show_results_and_select(results);
 }
@@ -458,23 +401,26 @@ void begin_benchmark(metadb_handle_list_cref data) {
         MessageBoxW(
             core_api::get_main_window(),
             L"The benchmark currently requires a local audio file.",
-            L"Stem Separator Benchmark",
-            MB_OK | MB_ICONWARNING);
+            L"Stem Separator Benchmark", MB_OK | MB_ICONWARNING);
         return;
     }
 
+    const auto adapters = onnxstem::enumerate_directml_adapters();
+    std::wostringstream prompt;
+    prompt << L"Stem Separator detected " << adapters.size()
+           << L" hardware DirectML adapter" << (adapters.size() == 1 ? L"" : L"s")
+           << L".\n\nIt will benchmark CPU and every detected GPU using the same 4-second audio clip.\n\n"
+              L"For the cleanest comparison, pause playback before running the test.\n"
+              L"The test can take several seconds and will heavily use the CPU/GPU while it runs.\n\n"
+              L"TIME: lower is better.  SPEED vs CPU: higher is better.\n\n"
+              L"Run the benchmark now?";
+
     const int answer = MessageBoxW(
-        core_api::get_main_window(),
-        L"Stem Separator will benchmark CPU and both DirectML adapters using the same 4-second audio clip.\n\n"
-        L"For the cleanest comparison, pause playback before running the test.\n"
-        L"The test can take several seconds and will heavily use the CPU/GPU while it runs.\n\n"
-        L"TIME: lower is better.  SPEED vs CPU: higher is better.\n\n"
-        L"Run the benchmark now?",
+        core_api::get_main_window(), prompt.str().c_str(),
         L"Stem Separator Benchmark",
         MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON1);
 
     if (answer != IDYES) return;
-
     std::thread(benchmark_thread, source).detach();
 }
 
@@ -500,9 +446,9 @@ public:
 
     bool get_item_description(unsigned, pfc::string_base& out) override {
         out =
-            "Benchmark CPU and both DirectML adapters on the same 4-second stem block, "
-            "then choose which backend Stem Separator should use. Lower time is better; "
-            "higher speed-vs-CPU is better.";
+            "Benchmark CPU and every detected DirectML GPU on the same 4-second stem block, "
+            "then choose which backend Stem Separator should use. GPU preference is saved by "
+            "hardware identity and automatically falls back to CPU if unavailable.";
         return true;
     }
 
