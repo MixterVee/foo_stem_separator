@@ -5,9 +5,20 @@
 
 namespace onnxstem {
 
+enum class backend : int {
+    selected = -1,
+    cpu = 0,
+    directml_adapter0 = 1,
+    directml_adapter1 = 2
+};
+
+backend selected_backend();
+void select_backend(backend value);
+const wchar_t* backend_name(backend value);
+
 class engine {
 public:
-    engine();
+    explicit engine(backend requested = backend::selected);
     ~engine();
 
     engine(const engine&) = delete;
@@ -30,10 +41,16 @@ private:
     bool initialize();
     void shutdown();
 
+    backend desired_backend() const;
+
     std::wstring component_directory() const;
     std::wstring dll_path() const;
     std::wstring vocals_model_path() const;
     std::wstring accompaniment_model_path() const;
+    std::wstring directml_config_path(backend value) const;
+
+    backend m_requested_backend = backend::selected;
+    backend m_active_backend = backend::selected;
 
     void* m_module = nullptr;
     const void* m_separator = nullptr;
