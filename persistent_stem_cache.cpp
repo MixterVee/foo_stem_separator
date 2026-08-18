@@ -13,7 +13,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -25,11 +27,24 @@ constexpr uint32_t kVersion = 1;
 constexpr uint32_t kRate = 44100;
 constexpr uint32_t kChannels = 2;
 constexpr uint64_t kMaxSegmentFrames = static_cast<uint64_t>(kRate) * 10u;
+constexpr uint64_t kMaxCacheBytes = 10ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t kTrimCacheBytes = 8ull * 1024ull * 1024ull * 1024ull;
+constexpr ULONGLONG kCleanupIntervalMs = 60ull * 1000ull;
+constexpr wchar_t kAccessMarkerName[] = L".access";
+
+std::mutex g_cache_mutex;
+ULONGLONG g_last_cleanup_tick = 0;
 
 struct source_fingerprint {
     uint64_t path_hash = 0;
     uint64_t size = 0;
     uint64_t write_time = 0;
+};
+
+struct track_cache_info {
+    fs::path path;
+    uint64_t bytes = 0;
+    fs::file_time_type last_access = fs::file_time_type::min();
 };
 
 #pragma pack(push, 1)
@@ -116,9 +131,102 @@ bool header_matches(const file_header& h, const source_fingerprint& fp) {
         h.frame_count <= kMaxSegmentFrames;
 }
 
+void touch_access_marker(const fs::path& dir) {
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) return;
+
+    const fs::path marker = dir / kAccessMarkerName;
+    std::ofstream file(marker, std::ios::binary | std::ios::trunc);
+    if (!file) return;
+    file.put('1');
+    file.close();
+}
+
+track_cache_info inspect_track_cache(const fs::path& dir) {
+    track_cache_info info;
+    info.path = dir;
+
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            ec.clear();
+            continue;
+        }
+
+        const uint64_t size = static_cast<uint64_t>(it->file_size(ec));
+        if (!ec) info.bytes += size;
+        ec.clear();
+
+        const fs::file_time_type stamp = it->last_write_time(ec);
+        if (!ec && stamp > info.last_access) info.last_access = stamp;
+        ec.clear();
+    }
+
+    const fs::path marker = dir / kAccessMarkerName;
+    const fs::file_time_type marker_time = fs::last_write_time(marker, ec);
+    if (!ec) info.last_access = marker_time;
+
+    return info;
+}
+
+void prune_cache_locked(const fs::path& protected_dir) {
+    const fs::path root = root_path();
+    if (root.empty()) return;
+
+    std::error_code ec;
+    if (!fs::exists(root, ec) || ec) return;
+
+    std::vector<track_cache_info> tracks;
+    uint64_t total_bytes = 0;
+
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_directory(ec)) {
+            ec.clear();
+            continue;
+        }
+
+        track_cache_info info = inspect_track_cache(it->path());
+        total_bytes += info.bytes;
+        tracks.push_back(std::move(info));
+    }
+
+    if (total_bytes <= kMaxCacheBytes) return;
+
+    std::sort(tracks.begin(), tracks.end(), [](const track_cache_info& a, const track_cache_info& b) {
+        return a.last_access < b.last_access;
+    });
+
+    const fs::path protected_normal = protected_dir.lexically_normal();
+
+    for (const auto& track : tracks) {
+        if (total_bytes <= kTrimCacheBytes) break;
+        if (!protected_dir.empty() && track.path.lexically_normal() == protected_normal) continue;
+
+        const uint64_t removed_bytes = track.bytes;
+        fs::remove_all(track.path, ec);
+        if (!ec) {
+            total_bytes = total_bytes > removed_bytes
+                ? total_bytes - removed_bytes
+                : 0;
+        }
+        ec.clear();
+    }
+}
+
+void maybe_prune_cache_locked(const fs::path& protected_dir) {
+    const ULONGLONG now = GetTickCount64();
+    if (g_last_cleanup_tick != 0 && now - g_last_cleanup_tick < kCleanupIntervalMs) {
+        return;
+    }
+    g_last_cleanup_tick = now;
+    prune_cache_locked(protected_dir);
+}
+
 } // namespace
 
 std::vector<segment> load(const std::wstring& source_path) {
+    std::lock_guard<std::mutex> guard(g_cache_mutex);
     std::vector<segment> out;
 
     source_fingerprint fp;
@@ -128,7 +236,10 @@ std::vector<segment> load(const std::wstring& source_path) {
     if (dir.empty()) return out;
 
     std::error_code ec;
-    if (!fs::exists(dir, ec) || ec) return out;
+    if (!fs::exists(dir, ec) || ec) {
+        maybe_prune_cache_locked({});
+        return out;
+    }
 
     for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         const auto path = it->path();
@@ -173,6 +284,9 @@ std::vector<segment> load(const std::wstring& source_path) {
     std::sort(out.begin(), out.end(), [](const segment& a, const segment& b) {
         return a.start_frame < b.start_frame;
     });
+
+    if (!out.empty()) touch_access_marker(dir);
+    maybe_prune_cache_locked(dir);
     return out;
 }
 
@@ -181,6 +295,8 @@ bool save(
     uint64_t start_frame,
     const std::vector<float>& vocals,
     const std::vector<float>& instrumental) {
+
+    std::lock_guard<std::mutex> guard(g_cache_mutex);
 
     if (source_path.empty() || vocals.empty() || vocals.size() != instrumental.size()) {
         return false;
@@ -238,6 +354,8 @@ bool save(
         return false;
     }
 
+    touch_access_marker(dir);
+    maybe_prune_cache_locked(dir);
     return true;
 }
 
