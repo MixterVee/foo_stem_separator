@@ -1,9 +1,12 @@
 name: Promote tested Auto Fastest source temp
 
 on:
-  pull_request:
-    types: [opened]
+  workflow_dispatch:
+  push:
     branches: [ main ]
+    paths:
+      - '.github/workflows/promote-auto-fastest-source-temp.yml'
+      - 'promote-auto-fastest-main-trigger.txt'
 
 permissions:
   contents: write
