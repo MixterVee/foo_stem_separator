@@ -1,0 +1,52 @@
+name: Promote tested persistent cache source
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/promote-persistent-cache-source.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: windows-2022
+    steps:
+      - name: Check out tested persistent cache branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/persistent-stem-cache
+          fetch-depth: 0
+
+      - name: Materialize exact tested v2 patch
+        shell: powershell
+        run: |
+          python .\patch-persistent-cache.py
+          if ($LASTEXITCODE -ne 0) { throw "Persistent cache patch failed." }
+
+          $buildScript = "build-ci-v12.ps1"
+          $text = Get-Content $buildScript -Raw
+          if ($text -notmatch 'persistent_stem_cache\.cpp') {
+            $text = $text.Replace(
+              '    "onnx_stem_engine.cpp",',
+              "    `"onnx_stem_engine.cpp`",`r`n    `"persistent_stem_cache.cpp`",")
+          }
+          if ($text -notmatch 'persistent_stem_cache\.h') {
+            $text = $text.Replace(
+              '    "onnx_stem_engine.h",',
+              "    `"onnx_stem_engine.h`",`r`n    `"persistent_stem_cache.h`",")
+          }
+          if ($text -notmatch 'persistent_stem_cache\.cpp' -or $text -notmatch 'persistent_stem_cache\.h') {
+            throw "Could not permanently add persistent cache sources to build-ci-v12.ps1"
+          }
+          Set-Content $buildScript $text -Encoding UTF8
+
+          New-Item -ItemType Directory -Force deliverables | Out-Null
+          Set-Content deliverables/persistent-cache-promotion-run-id.txt "$env:GITHUB_RUN_ID" -Encoding ascii
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add stem_dsp.cpp build-ci-v12.ps1 deliverables/persistent-cache-promotion-run-id.txt
+          git commit -m "Materialize tested persistent cache v2 source"
+          git push origin HEAD:agent/persistent-stem-cache
