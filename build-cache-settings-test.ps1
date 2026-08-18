@@ -14,6 +14,11 @@ try {
         throw "Cache settings source patch failed."
     }
 
+    python .\patch-cache-settings-compilefix.py
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cache settings Windows compile fix failed."
+    }
+
     & .\build-ci-v12.ps1 `
         -SdkRoot $SdkRoot `
         -RepoRoot $RepoRoot `
