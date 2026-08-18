@@ -1,9 +1,19 @@
-name: Build stable foobar2000 Stem Separator
+name: Build Stem Separator cache cleanup test
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ agent/persistent-cache-cleanup ]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'persistent_stem_cache.cpp'
+      - 'persistent_stem_cache.h'
+      - 'patch-persistent-cache.py'
+      - 'cache-cleanup-trigger.txt'
+
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   build:
@@ -12,6 +22,20 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Record run id for chat handoff
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\deliverables" | Out-Null
+          Set-Content "$env:GITHUB_WORKSPACE\deliverables\cache-cleanup-run-id.txt" "$env:GITHUB_RUN_ID" -Encoding ascii
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deliverables/cache-cleanup-run-id.txt
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Record cache cleanup test run [skip ci]"
+            git push origin HEAD:agent/persistent-cache-cleanup
+          }
 
       - name: Add Visual Studio 2022 MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -143,24 +167,24 @@ jobs:
           Copy-Item $vocals.FullName "$modelDir\vocals.fp16.onnx" -Force
           Copy-Item $accomp.FullName "$modelDir\accompaniment.fp16.onnx" -Force
 
-      - name: Create stable fb2k component package
+      - name: Create cache cleanup test package
         shell: powershell
         run: |
           $dist = "$env:GITHUB_WORKSPACE\dist"
-          Set-Content "$dist\BACKENDS.txt" @(
-            "Stem Separator 2.5.0 dynamic DirectML processing backend",
-            "Enumerates every hardware DXGI adapter and benchmarks each DirectML backend.",
-            "GPU preference is saved by hardware identity rather than adapter index.",
-            "Missing or failed preferred GPU falls back to CPU automatically.",
-            "Benchmark: TIME lower is better; SPEED vs CPU higher is better."
+          Set-Content "$dist\CACHE_CLEANUP_TEST.txt" @(
+            "Stem Separator persistent cache cleanup test",
+            "Cache maximum: 10 GiB.",
+            "When exceeded, least-recently-used whole-track caches are removed until approximately 8 GiB remains.",
+            "The track currently being loaded or saved is protected from cleanup.",
+            "LRU access is tracked by a per-track .access marker."
           ) -Encoding UTF8
           $tempZip = "$env:RUNNER_TEMP\foo_stem_separator.zip"
           Compress-Archive -Path "$dist\*" -DestinationPath $tempZip -Force
           Copy-Item $tempZip "$dist\foo_stem_separator.fb2k-component" -Force
 
-      - name: Upload stable component
+      - name: Upload cache cleanup test component
         uses: actions/upload-artifact@v4
         with:
-          name: foo_stem_separator-stable
+          name: foo_stem_separator-cache-cleanup-test
           path: dist/**
           if-no-files-found: error
