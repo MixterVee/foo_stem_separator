@@ -41,7 +41,8 @@ $hFiles = @(
     "stem_mode.h",
     "onnx_stem_engine.h",
     "stem_waveform_provider.h",
-    "stem_transport_service.h"
+    "stem_transport_service.h",
+    "stem_processing_status_service.h"
 )
 
 foreach ($name in ($cppFiles + $hFiles)) {
@@ -179,3 +180,4 @@ finally {
         Remove-Item $backup -Force
     }
 }
+

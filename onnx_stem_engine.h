@@ -32,6 +32,17 @@ backend selected_backend();
 void select_backend(backend value);
 std::wstring backend_name(backend value);
 
+struct runtime_status {
+    backend active_backend = backend::selected;
+    bool engine_ready = false;
+    bool using_fallback = false;
+    bool processing = false;
+    std::wstring backend_label;
+};
+
+runtime_status current_runtime_status();
+bool selected_backend_preference_is_gpu();
+
 class engine {
 public:
     explicit engine(backend requested = backend::selected);
@@ -42,6 +53,12 @@ public:
 
     bool ready();
     const std::wstring& last_error() const noexcept { return m_error; }
+    backend active_backend() const noexcept { return m_active_backend; }
+    bool using_fallback() const noexcept {
+        return m_requested_backend == backend::selected &&
+            m_separator != nullptr && m_active_backend == backend::cpu &&
+            (is_directml_backend(m_desired_backend) || selected_backend_preference_is_gpu());
+    }
 
     // Separates one stereo 44.1-kHz interleaved block and returns BOTH stems
     // from a single sherpa-onnx inference call.
@@ -83,3 +100,4 @@ private:
 };
 
 } // namespace onnxstem
+
