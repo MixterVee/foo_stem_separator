@@ -1,9 +1,12 @@
-name: Build stable foobar2000 Stem Separator
+name: Build Stem Separator cache settings test
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ agent/cache-settings ]
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -12,6 +15,20 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Record run id for chat handoff
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\deliverables" | Out-Null
+          Set-Content "$env:GITHUB_WORKSPACE\deliverables\cache-settings-run-id.txt" "$env:GITHUB_RUN_ID" -Encoding ascii
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deliverables/cache-settings-run-id.txt
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Record cache settings test run [skip ci]"
+            git push origin HEAD:agent/cache-settings
+          }
 
       - name: Add Visual Studio 2022 MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -68,10 +85,10 @@ jobs:
           git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git $sdkRoot
           if (-not (Test-Path $sdkRoot)) { throw "foobar2000 SDK clone failed." }
 
-      - name: Build Stem Separator DLL
+      - name: Build Stem Separator DLL with cache settings patch
         shell: powershell
         run: |
-          .\build-ci-v12.ps1 `
+          .\build-cache-settings-test.ps1 `
             -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk" `
             -RepoRoot "$env:GITHUB_WORKSPACE" `
             -WtlInclude "$env:WTL_INCLUDE" `
@@ -143,24 +160,24 @@ jobs:
           Copy-Item $vocals.FullName "$modelDir\vocals.fp16.onnx" -Force
           Copy-Item $accomp.FullName "$modelDir\accompaniment.fp16.onnx" -Force
 
-      - name: Create stable fb2k component package
+      - name: Create cache settings test package
         shell: powershell
         run: |
           $dist = "$env:GITHUB_WORKSPACE\dist"
-          Set-Content "$dist\BACKENDS.txt" @(
-            "Stem Separator 2.5.0 dynamic DirectML processing backend",
-            "Enumerates every hardware DXGI adapter and benchmarks each DirectML backend.",
-            "GPU preference is saved by hardware identity rather than adapter index.",
-            "Missing or failed preferred GPU falls back to CPU automatically.",
-            "Benchmark: TIME lower is better; SPEED vs CPU higher is better."
+          Set-Content "$dist\CACHE_SETTINGS_TEST.txt" @(
+            "Stem Separator cache settings test",
+            "Persistent cache defaults to ON.",
+            "Default maximum remains 10 GB.",
+            "Cache Settings submenu provides enable/disable, current size, clear, and size presets.",
+            "Lossless compressed cache format and restore barrier remain unchanged."
           ) -Encoding UTF8
           $tempZip = "$env:RUNNER_TEMP\foo_stem_separator.zip"
           Compress-Archive -Path "$dist\*" -DestinationPath $tempZip -Force
           Copy-Item $tempZip "$dist\foo_stem_separator.fb2k-component" -Force
 
-      - name: Upload stable component
+      - name: Upload cache settings test component
         uses: actions/upload-artifact@v4
         with:
-          name: foo_stem_separator-stable
+          name: foo_stem_separator-cache-settings-test
           path: dist/**
           if-no-files-found: error
