@@ -19,6 +19,11 @@ try {
         throw "Cache settings Windows compile fix failed."
     }
 
+    python .\patch-cache-settings-configsplit.py
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cache settings config split failed."
+    }
+
     & .\build-ci-v12.ps1 `
         -SdkRoot $SdkRoot `
         -RepoRoot $RepoRoot `
