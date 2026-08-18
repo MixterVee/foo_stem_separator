@@ -18,18 +18,6 @@ Write-Host "==============================================="
 Write-Host "V12 - NATIVE ONNX DSP PROTOTYPE"
 Write-Host "==============================================="
 
-# The SDK used by this CI target resolves cfg_int to the legacy implementation.
-# Both legacy and modern cfg_int support assignment, while only modern exposes
-# .set(). Normalize the experimental backend selector before copying sources.
-$engineSource = Join-Path $RepoRoot "onnx_stem_engine.cpp"
-if (Test-Path $engineSource) {
-    $engineText = Get-Content $engineSource -Raw
-    $engineText = $engineText.Replace("g_backend_cfg.set(0);", "g_backend_cfg = 0;")
-    $engineText = $engineText.Replace("g_backend_cfg.set(1);", "g_backend_cfg = 1;")
-    $engineText = $engineText.Replace("g_backend_cfg.set(2);", "g_backend_cfg = 2;")
-    Set-Content -Path $engineSource -Value $engineText -Encoding UTF8
-}
-
 $sampleProject = Get-ChildItem -Path $SdkRoot -Filter "foo_sample.vcxproj" -Recurse |
     Select-Object -First 1
 
@@ -45,7 +33,8 @@ $cppFiles = @(
     "stem_mode.cpp",
     "onnx_stem_engine.cpp",
     "stem_dsp.cpp",
-    "stem_waveform_provider.cpp"
+    "stem_waveform_provider.cpp",
+    "stem_benchmark.cpp"
 )
 
 $hFiles = @(
