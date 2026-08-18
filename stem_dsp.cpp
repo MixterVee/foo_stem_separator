@@ -502,26 +502,14 @@ public:
         m_job_pending = false;
 
         if (!m_path.empty()) {
+            // Persistent restore is a startup barrier. Do not queue live Spleeter
+            // work at the same time: compressed cache restore can take long enough
+            // for playback/mode switching to observe a half-initialized cache.
+            // The restore job publishes all disk segments atomically, then queues
+            // only whatever initial work is still missing.
             m_jobs.emplace_back(cache_job{
                 m_generation, m_path, 0.0, false, false, false, true});
             m_job_pending = true;
-
-            const stemmode::mode mode = stemmode::get();
-            const bool warm_stems =
-                mode != stemmode::mode::original || stem_precache::enabled();
-            if (warm_stems) {
-                // Pre-cache now means PRE-cache: start Spleeter as soon as a new
-                // track begins even while Original is selected. The generated
-                // segment contains Original + Vocals + Instrumental, so no
-                // separate Original decoder job is needed for this region.
-                queue_job_locked(0.0, true);
-            } else {
-                // Pre-cache was explicitly disabled: retain the cheap Original
-                // decoder-only behavior and leave ONNX lazy.
-                m_jobs.emplace_back(cache_job{
-                    m_generation, m_path, 0.0, true, false, false});
-                m_job_pending = true;
-            }
         }
 
         m_cv.notify_one();
@@ -1919,16 +1907,11 @@ private:
 
             mf_started = true;
 
-            // Pre-cache is enabled by default. Warm the ONNX/Spleeter session on
-            // the cache worker immediately so the first user stem request does not
-            // also pay DLL/model/session creation. This never blocks foobar's UI or
-            // ordinary Original playback. If pre-cache is disabled, preserve lazy
-            // initialization exactly as before.
+            // Disk restore must run before any expensive ONNX initialization.
+            // Cached tracks can therefore become ready immediately after restart
+            // without paying model/session startup at all. For uncached tracks the
+            // first real stem job still constructs the engine lazily below.
             std::unique_ptr<onnxstem::engine> engine;
-            if (stem_precache::enabled()) {
-                engine = std::make_unique<onnxstem::engine>();
-                engine->ready();
-            }
 
             sequential_decoder_state decoder_state;
             sequential_decoder_state preview_decoder_state;
@@ -1966,6 +1949,9 @@ private:
                             std::lock_guard<std::mutex> lock(m_mutex);
                             if (job.generation == m_generation &&
                                 _wcsicmp(job.path.c_str(), m_path.c_str()) == 0) {
+                                // Publish the complete restored cache as one state
+                                // transition. Ordinary forward stem playback never
+                                // sees a partially restored track.
                                 for (auto& disk : disk_segments) {
                                     cache_segment seg;
                                     seg.generation = job.generation;
@@ -1979,6 +1965,26 @@ private:
                                     seg.external_waveform = false;
                                     m_segments.push_back(
                                         std::make_shared<cache_segment>(std::move(seg)));
+                                }
+
+                                const stemmode::mode mode = stemmode::get();
+                                const bool warm_stems =
+                                    mode != stemmode::mode::original || stem_precache::enabled();
+
+                                if (warm_stems) {
+                                    // If disk restore already covers the opening
+                                    // live block, do not immediately run Spleeter
+                                    // over the same samples again.
+                                    if (!internal_stem_range_ready_locked(
+                                            0.0, kCacheSeconds)) {
+                                        queue_job_locked(0.0, true);
+                                    }
+                                } else {
+                                    // Pre-cache disabled: retain the cheap Original
+                                    // decoder-only startup behavior after restore.
+                                    m_jobs.emplace_back(cache_job{
+                                        m_generation, m_path, 0.0, true, false, false});
+                                    m_job_pending = true;
                                 }
                             }
                             m_job_pending = !m_jobs.empty();
@@ -2112,11 +2118,9 @@ private:
                             apply_first_block_fade(vocals);
                             apply_first_block_fade(instrumental);
                         }
-                        const uint64_t start_frame = static_cast<uint64_t>(
-                            job.start_seconds * static_cast<double>(kCacheRate) + 0.5);
-                        persistent_stem_cache::save(
-                            job.path, start_frame, vocals, instrumental);
                     }
+
+                    std::shared_ptr<cache_segment> persist_segment;
 
                     {
                         std::lock_guard<std::mutex>
@@ -2149,7 +2153,12 @@ private:
                                 // Completed segments remain valid for the whole track.
                                 // This also makes short reverse moves instant instead of
                                 // re-running Spleeter after every release/seek.
-                                m_segments.push_back(std::make_shared<cache_segment>(std::move(seg)));
+                                auto completed_segment =
+                                    std::make_shared<cache_segment>(std::move(seg));
+                                if (job.need_stems) {
+                                    persist_segment = completed_segment;
+                                }
+                                m_segments.push_back(std::move(completed_segment));
                             }
 
                             m_job_pending =
@@ -2157,7 +2166,22 @@ private:
                         }
                     }
 
+                    // Make the newly separated PCM visible to playback and release
+                    // any mode-switch waiter before doing potentially slower lossless
+                    // compression and disk I/O. This preserves the sample-locked
+                    // Original -> Vocals/Instrumental handoff.
                     m_ready_cv.notify_all();
+
+                    if (persist_segment) {
+                        const uint64_t start_frame = static_cast<uint64_t>(
+                            persist_segment->start_seconds *
+                            static_cast<double>(kCacheRate) + 0.5);
+                        persistent_stem_cache::save(
+                            job.path,
+                            start_frame,
+                            persist_segment->vocals,
+                            persist_segment->instrumental);
+                    }
                 }
                 catch (const std::exception&) {
                     // A failed cache job must never take foobar down.
