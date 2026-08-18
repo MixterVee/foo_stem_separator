@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
     paths:
-      - '.github/workflows/promote-persistent-cache-source.yml'
+      - 'persistent-cache-main-trigger.txt'
 
 permissions:
   contents: write
@@ -24,16 +24,13 @@ jobs:
         run: |
           git fetch origin agent/persistent-stem-cache
 
-          # Bring in the exact cache module that was packaged in the accepted v2 build.
           git checkout origin/agent/persistent-stem-cache -- persistent_stem_cache.cpp persistent_stem_cache.h
 
-          # Materialize the exact tested build-time v2 integration into stable stem_dsp.cpp.
           git show origin/agent/persistent-stem-cache:patch-persistent-cache.py | Set-Content .\patch-persistent-cache.py -Encoding UTF8
           python .\patch-persistent-cache.py
           if ($LASTEXITCODE -ne 0) { throw "Persistent cache v2 patch failed." }
           Remove-Item .\patch-persistent-cache.py -Force
 
-          # Make the cache module a permanent part of the normal stable build.
           $buildScript = "build-ci-v12.ps1"
           $text = Get-Content $buildScript -Raw
           if ($text -notmatch 'persistent_stem_cache\.cpp') {
@@ -51,8 +48,8 @@ jobs:
           }
           Set-Content $buildScript $text -Encoding UTF8
 
-          # One clean stable commit: real source only, no promotion scaffolding.
           git rm .github/workflows/promote-persistent-cache-source.yml
+          git rm persistent-cache-main-trigger.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add stem_dsp.cpp build-ci-v12.ps1 persistent_stem_cache.cpp persistent_stem_cache.h
