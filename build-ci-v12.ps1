@@ -26,6 +26,14 @@ if (Test-Path $handoffPatch) {
     }
 }
 
+$restoreBarrierPatch = Join-Path $RepoRoot "patch-compression-restore-barrier.py"
+if (Test-Path $restoreBarrierPatch) {
+    python $restoreBarrierPatch
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cache compression restore barrier patch failed."
+    }
+}
+
 $sampleProject = Get-ChildItem -Path $SdkRoot -Filter "foo_sample.vcxproj" -Recurse |
     Select-Object -First 1
 
