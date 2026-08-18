@@ -5,6 +5,9 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-2022
@@ -12,6 +15,30 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Finalize 2.5.0 metadata and record run id
+        shell: powershell
+        run: |
+          $source = "$env:GITHUB_WORKSPACE\foo_stem_separator.cpp"
+          $text = Get-Content $source -Raw
+          $old = '"2.4.0 EOF-safe FIFO cache + startup de-click + MP3/WAV export"'
+          $new = '"2.5.0 Dynamic DirectML GPU backends + benchmark"'
+          if ($text.Contains($old)) {
+            $text = $text.Replace($old, $new)
+            Set-Content -Path $source -Value $text -Encoding UTF8
+          }
+
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\deliverables" | Out-Null
+          Set-Content "$env:GITHUB_WORKSPACE\deliverables\stable-run-id.txt" "$env:GITHUB_RUN_ID" -Encoding ascii
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add foo_stem_separator.cpp deliverables/stable-run-id.txt
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Finalize dynamic GPU stable metadata [skip ci]"
+            git push origin HEAD:main
+          }
 
       - name: Add Visual Studio 2022 MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -148,7 +175,7 @@ jobs:
         run: |
           $dist = "$env:GITHUB_WORKSPACE\dist"
           Set-Content "$dist\BACKENDS.txt" @(
-            "Stem Separator dynamic DirectML processing backend",
+            "Stem Separator 2.5.0 dynamic DirectML processing backend",
             "Enumerates every hardware DXGI adapter and benchmarks each DirectML backend.",
             "GPU preference is saved by hardware identity rather than adapter index.",
             "Missing or failed preferred GPU falls back to CPU automatically.",
