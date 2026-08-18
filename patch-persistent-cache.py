@@ -39,5 +39,23 @@ repl(
 '''                    const bool stem_payload_ok =\n                        !job.need_stems ||\n                        (separated &&\n                         vocals.size() == input.size() &&\n                         instrumental.size() == input.size());\n\n                    if (decoded && !input.empty() && stem_payload_ok && job.need_stems) {\n                        if (job.start_seconds <= 0.000001) {\n                            apply_first_block_fade(vocals);\n                            apply_first_block_fade(instrumental);\n                        }\n                        const uint64_t start_frame = static_cast<uint64_t>(\n                            job.start_seconds * static_cast<double>(kCacheRate) + 0.5);\n                        persistent_stem_cache::save(\n                            job.path, start_frame, vocals, instrumental);\n                    }\n\n                    {\n                        std::lock_guard<std::mutex>\n                            lock(m_mutex);\n\n                        // Seek/new-track happened while this job ran.\n                        if (job.generation !=\n                            m_generation) {\n\n                            m_job_pending =\n                                !m_jobs.empty();\n                        }\n                        else {\n                            if (decoded && !input.empty() && stem_payload_ok) {\n                                const size_t frames = input.size() / kCacheChannels;\n''',
     'save completed block')
 
+# Ordinary forward playback must remain on the Stem worker's sample-locked
+# timeline. Spectral Waveform's independently-seeked tiles remain available for
+# transport preview, but cannot be the first source used by a mode switch.
+repl(
+'''        std::vector<float>& out,\n        double source_rate = 1.0) {\n''',
+'''        std::vector<float>& out,\n        double source_rate = 1.0,\n        bool allow_external_fallback = true) {\n''',
+    'render external fallback option')
+
+repl(
+'''            if (!first) {\n                // External Spectral PCM is fallback-only. If two contextual tiles\n''',
+'''            if (!first && allow_external_fallback) {\n                // External Spectral PCM is fallback-only. If two contextual tiles\n''',
+    'external fallback gate')
+
+repl(
+'''        const bool have_cache =\n            cache_manager().render(\n                mode,\n                m_position_seconds,\n                rate,\n                frames,\n                rendered);\n''',
+'''        const bool have_cache =\n            cache_manager().render(\n                mode,\n                m_position_seconds,\n                rate,\n                frames,\n                rendered,\n                1.0,\n                false);\n''',
+    'ordinary playback internal-only')
+
 p.write_text(s, encoding='utf-8')
-print('Persistent cache integration applied')
+print('Persistent cache integration applied with sample-locked normal playback')
