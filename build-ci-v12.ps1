@@ -18,6 +18,14 @@ Write-Host "==============================================="
 Write-Host "V12 - NATIVE ONNX DSP PROTOTYPE"
 Write-Host "==============================================="
 
+$handoffPatch = Join-Path $RepoRoot "patch-cache-compression-handoff.py"
+if (Test-Path $handoffPatch) {
+    python $handoffPatch
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cache compression handoff timing patch failed."
+    }
+}
+
 $sampleProject = Get-ChildItem -Path $SdkRoot -Filter "foo_sample.vcxproj" -Recurse |
     Select-Object -First 1
 
