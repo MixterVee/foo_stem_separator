@@ -34,6 +34,7 @@
 #include "stem_mode.h"
 #include "stem_transport_service.h"
 #include "stem_processing_status_service.h"
+#include "persistent_stem_cache.h"
 
 namespace stem_precache {
 bool enabled();
@@ -322,6 +323,7 @@ struct cache_job {
     bool force_reanchor = false;
     bool transport_preview = false;
     bool need_stems = true;
+    bool restore_persisted = false;
 };
 
 struct sequential_decoder_state {
@@ -500,6 +502,10 @@ public:
         m_job_pending = false;
 
         if (!m_path.empty()) {
+            m_jobs.emplace_back(cache_job{
+                m_generation, m_path, 0.0, false, false, false, true});
+            m_job_pending = true;
+
             const stemmode::mode mode = stemmode::get();
             const bool warm_stems =
                 mode != stemmode::mode::original || stem_precache::enabled();
@@ -955,7 +961,8 @@ public:
         unsigned output_rate,
         size_t frames,
         std::vector<float>& out,
-        double source_rate = 1.0) {
+        double source_rate = 1.0,
+        bool allow_external_fallback = true) {
 
         if (output_rate == 0 ||
             frames == 0) {
@@ -1086,7 +1093,7 @@ public:
                 }
             }
 
-            if (!first) {
+            if (!first && allow_external_fallback) {
                 // External Spectral PCM is fallback-only. If two contextual tiles
                 // overlap, retain both so the existing handoff crossfade still
                 // protects the fallback path from a hard tile seam.
@@ -1293,6 +1300,27 @@ private:
                 if (!segment_has_mode(seg, mode)) continue;
                 if (seg.start_seconds <= cursor + 1.0e-6 &&
                     seg.end_seconds > furthest) {
+                    furthest = seg.end_seconds;
+                }
+            }
+            if (furthest <= cursor + 1.0e-6) return false;
+            cursor = furthest;
+        }
+        return true;
+    }
+
+    bool internal_stem_range_ready_locked(
+        double start_seconds,
+        double end_seconds) const {
+
+        if (end_seconds <= start_seconds + 1.0e-6) return true;
+        double cursor = start_seconds;
+        while (cursor < end_seconds - 1.0e-6) {
+            double furthest = cursor;
+            for (const auto& seg_ptr : m_segments) {
+                const cache_segment& seg = *seg_ptr;
+                if (seg.external_waveform || seg.vocals.empty() || seg.instrumental.empty()) continue;
+                if (seg.start_seconds <= cursor + 1.0e-6 && seg.end_seconds > furthest) {
                     furthest = seg.end_seconds;
                 }
             }
@@ -1932,6 +1960,49 @@ private:
                 }
 
                 try {
+                    if (job.restore_persisted) {
+                        auto disk_segments = persistent_stem_cache::load(job.path);
+                        {
+                            std::lock_guard<std::mutex> lock(m_mutex);
+                            if (job.generation == m_generation &&
+                                _wcsicmp(job.path.c_str(), m_path.c_str()) == 0) {
+                                for (auto& disk : disk_segments) {
+                                    cache_segment seg;
+                                    seg.generation = job.generation;
+                                    seg.start_seconds = static_cast<double>(disk.start_frame) /
+                                        static_cast<double>(kCacheRate);
+                                    const size_t frames = disk.vocals.size() / kCacheChannels;
+                                    seg.end_seconds = seg.start_seconds +
+                                        static_cast<double>(frames) / static_cast<double>(kCacheRate);
+                                    seg.vocals = std::move(disk.vocals);
+                                    seg.instrumental = std::move(disk.instrumental);
+                                    seg.external_waveform = false;
+                                    m_segments.push_back(
+                                        std::make_shared<cache_segment>(std::move(seg)));
+                                }
+                            }
+                            m_job_pending = !m_jobs.empty();
+                        }
+                        m_ready_cv.notify_all();
+                        continue;
+                    }
+
+                    if (job.need_stems) {
+                        bool already_cached = false;
+                        {
+                            std::lock_guard<std::mutex> lock(m_mutex);
+                            if (job.generation == m_generation &&
+                                _wcsicmp(job.path.c_str(), m_path.c_str()) == 0) {
+                                already_cached = internal_stem_range_ready_locked(
+                                    job.start_seconds, job.start_seconds + kCacheSeconds);
+                            }
+                        }
+                        if (already_cached) {
+                            release_waiters(job.generation);
+                            continue;
+                        }
+                    }
+
                     std::vector<float> input;
 
                     // Transport preview gets a separate decoder timeline. A random
@@ -2030,6 +2101,23 @@ private:
                         }
                     }
 
+                    const bool stem_payload_ok =
+                        !job.need_stems ||
+                        (separated &&
+                         vocals.size() == input.size() &&
+                         instrumental.size() == input.size());
+
+                    if (decoded && !input.empty() && stem_payload_ok && job.need_stems) {
+                        if (job.start_seconds <= 0.000001) {
+                            apply_first_block_fade(vocals);
+                            apply_first_block_fade(instrumental);
+                        }
+                        const uint64_t start_frame = static_cast<uint64_t>(
+                            job.start_seconds * static_cast<double>(kCacheRate) + 0.5);
+                        persistent_stem_cache::save(
+                            job.path, start_frame, vocals, instrumental);
+                    }
+
                     {
                         std::lock_guard<std::mutex>
                             lock(m_mutex);
@@ -2042,20 +2130,7 @@ private:
                                 !m_jobs.empty();
                         }
                         else {
-                            const bool stem_payload_ok =
-                                !job.need_stems ||
-                                (separated &&
-                                 vocals.size() == input.size() &&
-                                 instrumental.size() == input.size());
-
                             if (decoded && !input.empty() && stem_payload_ok) {
-                                // Only the first separated live cache block gets this
-                                // tiny fade. Original preview data is never altered.
-                                if (job.need_stems && job.start_seconds <= 0.000001) {
-                                    apply_first_block_fade(vocals);
-                                    apply_first_block_fade(instrumental);
-                                }
-
                                 const size_t frames = input.size() / kCacheChannels;
                                 const double duration =
                                     static_cast<double>(frames) /
@@ -3076,7 +3151,9 @@ public:
                 m_position_seconds,
                 rate,
                 frames,
-                rendered);
+                rendered,
+                1.0,
+                false);
 
         const audio_sample* original =
             chunk->get_data();

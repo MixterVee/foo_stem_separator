@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory=$true)]
     [string]$SdkRoot,
 
@@ -192,3 +192,4 @@ finally {
         Remove-Item $backup -Force
     }
 }
+
