@@ -62,6 +62,13 @@ using ProcessFn = const SeparationOutput* (__cdecl*)(
     int32_t);
 using DestroyOutputFn = void (__cdecl*)(const SeparationOutput*);
 
+static const GUID g_backend_cfg_guid =
+    {0x5c882f31,0x937b,0x4e51,{0xb0,0xc1,0x68,0x55,0x4a,0x6d,0x91,0x73}};
+
+// Adapter 1 is the default for this experiment because it is the NVIDIA
+// discrete GPU on the test machine and has already been verified to work.
+cfg_int g_backend_cfg(g_backend_cfg_guid, 2);
+
 std::wstring utf8_to_wide(const char* s) {
     if (!s || !*s) return {};
 
@@ -124,9 +131,61 @@ void copy_stem_interleaved(
     }
 }
 
+onnxstem::backend sanitize_backend(int64_t raw) {
+    switch (raw) {
+    case 0:
+        return onnxstem::backend::cpu;
+    case 1:
+        return onnxstem::backend::directml_adapter0;
+    case 2:
+        return onnxstem::backend::directml_adapter1;
+    default:
+        return onnxstem::backend::directml_adapter1;
+    }
+}
+
 } // namespace
 
 namespace onnxstem {
+
+backend selected_backend() {
+    return sanitize_backend(g_backend_cfg.get());
+}
+
+void select_backend(backend value) {
+    if (value == backend::selected) return;
+
+    switch (value) {
+    case backend::cpu:
+        g_backend_cfg.set(0);
+        break;
+    case backend::directml_adapter0:
+        g_backend_cfg.set(1);
+        break;
+    case backend::directml_adapter1:
+        g_backend_cfg.set(2);
+        break;
+    default:
+        break;
+    }
+}
+
+const wchar_t* backend_name(backend value) {
+    if (value == backend::selected) {
+        value = selected_backend();
+    }
+
+    switch (value) {
+    case backend::cpu:
+        return L"CPU";
+    case backend::directml_adapter0:
+        return L"DirectML adapter 0";
+    case backend::directml_adapter1:
+        return L"DirectML adapter 1";
+    default:
+        return L"Unknown";
+    }
+}
 
 struct engine::api {
     CreateFn create = nullptr;
@@ -135,10 +194,18 @@ struct engine::api {
     DestroyOutputFn destroy_output = nullptr;
 };
 
-engine::engine() = default;
+engine::engine(backend requested)
+    : m_requested_backend(requested) {
+}
 
 engine::~engine() {
     shutdown();
+}
+
+backend engine::desired_backend() const {
+    return m_requested_backend == backend::selected
+        ? selected_backend()
+        : m_requested_backend;
 }
 
 std::wstring engine::component_directory() const {
@@ -175,14 +242,46 @@ std::wstring engine::accompaniment_model_path() const {
     ).wstring();
 }
 
+std::wstring engine::directml_config_path(backend value) const {
+    const wchar_t* filename =
+        value == backend::directml_adapter1
+            ? L"directml-device1.config"
+            : L"directml-device0.config";
+
+    return (
+        fs::path(component_directory()) /
+        filename
+    ).wstring();
+}
+
 bool engine::ready() {
     return initialize();
 }
 
 bool engine::initialize() {
+    const backend wanted = desired_backend();
+
+    if (m_separator && m_active_backend == wanted) {
+        return true;
+    }
+
+    // A default-constructed engine follows the user's saved backend selection.
+    // If that selection changes while the cache worker is alive, tear down the
+    // old session and recreate it on the next separation call without needing
+    // a foobar2000 restart.
+    if (m_active_backend != wanted) {
+        shutdown();
+        m_active_backend = wanted;
+        m_attempted = false;
+        m_error.clear();
+    }
+
     if (m_separator) return true;
     if (m_attempted) return false;
+
+    m_active_backend = wanted;
     m_attempted = true;
+    m_error.clear();
 
     const auto dll = dll_path();
     const auto vocals = vocals_model_path();
@@ -196,6 +295,24 @@ bool engine::initialize() {
     if (!fs::exists(vocals) || !fs::exists(accomp)) {
         m_error = L"Missing Spleeter ONNX model files under models\\spleeter.";
         return false;
+    }
+
+    std::string provider8 = "cpu";
+
+    if (wanted == backend::directml_adapter0 ||
+        wanted == backend::directml_adapter1) {
+
+        const auto config_path = directml_config_path(wanted);
+        if (!fs::exists(config_path)) {
+            m_error =
+                L"Missing DirectML adapter configuration file: " +
+                config_path;
+            return false;
+        }
+
+        provider8 =
+            "directml:" +
+            wide_to_utf8(config_path);
     }
 
     HMODULE module = LoadLibraryExW(
@@ -256,13 +373,14 @@ bool engine::initialize() {
     config.model.spleeter.accompaniment = accomp8.c_str();
     config.model.num_threads = 2;
     config.model.debug = 0;
-    config.model.provider = "cpu";
+    config.model.provider = provider8.c_str();
 
     m_separator = api_ptr->create(&config);
 
     if (!m_separator) {
         m_error =
-            L"Sherpa-onnx could not create the Spleeter separation engine.";
+            L"Sherpa-onnx could not create the Spleeter separation engine for " +
+            std::wstring(backend_name(wanted)) + L".";
         FreeLibrary(module);
         m_module = nullptr;
         return false;
