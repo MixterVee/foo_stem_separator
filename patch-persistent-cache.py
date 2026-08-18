@@ -20,8 +20,8 @@ repl(
     'cache job flag')
 
 repl(
-'''        if (!m_path.empty()) {\n            const stemmode::mode mode = stemmode::get();\n''',
-'''        if (!m_path.empty()) {\n            m_jobs.emplace_back(cache_job{\n                m_generation, m_path, 0.0, false, false, false, true});\n            m_job_pending = true;\n\n            const stemmode::mode mode = stemmode::get();\n''',
+'''        m_segments.clear();\n        m_live_original.clear();\n        m_live_original_start_frame = 0;\n        m_jobs.clear();\n        m_job_pending = false;\n\n        if (!m_path.empty()) {\n            const stemmode::mode mode = stemmode::get();\n''',
+'''        m_segments.clear();\n        m_live_original.clear();\n        m_live_original_start_frame = 0;\n        m_jobs.clear();\n        m_job_pending = false;\n\n        if (!m_path.empty()) {\n            m_jobs.emplace_back(cache_job{\n                m_generation, m_path, 0.0, false, false, false, true});\n            m_job_pending = true;\n\n            const stemmode::mode mode = stemmode::get();\n''',
     'new track restore')
 
 repl(
