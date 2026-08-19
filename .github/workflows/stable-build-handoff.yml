@@ -1,0 +1,47 @@
+name: Stable Stem Build Handoff
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ stable-build-handoff-trigger.txt ]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Dispatch stable build and record run id
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          gh workflow run build.yml --ref main
+          run_id=""
+          for i in $(seq 1 30); do
+            run_id="$(gh run list --workflow build.yml --branch main --event workflow_dispatch --limit 20 --json databaseId,headSha,createdAt --jq '.[] | select(.headSha == "'"$head_sha"'") | .databaseId' | head -n 1)"
+            if [ -n "$run_id" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$run_id" ]; then
+            echo "Could not resolve dispatched stable build run id." >&2
+            exit 1
+          fi
+          mkdir -p deliverables
+          printf '%s\n' "$run_id" > deliverables/stable-stem-run-id.txt
+          rm -f stable-build-handoff-trigger.txt .github/workflows/stable-build-handoff.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Record stable Stem build run [skip ci]"
+          git push origin HEAD:main
