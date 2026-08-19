@@ -1,0 +1,1 @@
+promote tested cache settings to stable
