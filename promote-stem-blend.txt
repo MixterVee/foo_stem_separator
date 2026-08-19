@@ -1,0 +1,1 @@
+Promote the user-tested Stem Blend v1 patch to stable source.
