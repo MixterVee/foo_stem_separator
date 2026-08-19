@@ -67,6 +67,23 @@ void toggle() {
 
 } // namespace stem_precache
 
+namespace stem_gain_match {
+namespace {
+static const GUID g_gain_match_enabled_guid =
+    {0x8e6f2203,0x3aa6,0x43c8,{0x9d,0x2e,0x81,0x6d,0x61,0xa4,0x77,0x10}};
+cfg_int g_gain_match_enabled_cfg(g_gain_match_enabled_guid, 1);
+} // namespace
+
+bool enabled() {
+    return static_cast<int>(g_gain_match_enabled_cfg.get()) != 0;
+}
+
+void set_enabled(bool value) {
+    g_gain_match_enabled_cfg = value ? 1 : 0;
+}
+
+} // namespace stem_gain_match
+
 namespace persistent_stem_cache {
 namespace {
 static const GUID g_cache_enabled_guid =
@@ -908,6 +925,40 @@ static contextmenu_group_popup_factory g_stem_blend_instrumental_context_group_f
     g_stem_blend_context_group,
     "Instrumental",
     10);
+
+class stem_gain_match_context_menu : public contextmenu_item_simple {
+public:
+    GUID get_parent() override { return g_stem_separator_context_group; }
+
+    unsigned get_num_items() override { return 1; }
+
+    void get_item_name(unsigned, pfc::string_base& out) override {
+        out = stem_gain_match::enabled()
+            ? "Automatic Gain Matching: ON"
+            : "Automatic Gain Matching: OFF";
+    }
+
+    GUID get_item_guid(unsigned) override {
+        return {0xa92a1050,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x50}};
+    }
+
+    bool get_item_description(unsigned, pfc::string_base& out) override {
+        out = "Smoothly match live Vocals, Instrumental and Blend playback level to the Original mix. "
+              "Correction is conservative and peak-protected; exports and cached stem files are unchanged.";
+        return true;
+    }
+
+    void context_command(unsigned, metadb_handle_list_cref, const GUID&) override {
+        const bool next = !stem_gain_match::enabled();
+        stem_gain_match::set_enabled(next);
+        console::print(next
+            ? "Stem Separator: automatic gain matching ON"
+            : "Stem Separator: automatic gain matching OFF");
+    }
+};
+
+static contextmenu_item_factory_t<stem_gain_match_context_menu>
+    g_stem_gain_match_context_menu;
 
 class stem_cache_context_menu : public contextmenu_item_simple {
 public:

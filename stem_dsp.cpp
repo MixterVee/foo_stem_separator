@@ -40,6 +40,10 @@ namespace stem_precache {
 bool enabled();
 }
 
+namespace stem_gain_match {
+bool enabled();
+}
+
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
@@ -104,6 +108,62 @@ constexpr double kOriginalDecodeSeekPrerollSeconds = 0.50;
 constexpr double kOriginalRollingSeconds = 45.0;
 constexpr uint64_t kOriginalRollingJoinToleranceFrames = 8;
 constexpr double kFirstBlockFadeSeconds = 0.005;
+
+// Automatic gain matching is deliberately conservative. The target is derived
+// from the true decoded Original chunk and the already-rendered live stem chunk,
+// so no cache-format change or second inference pass is needed.
+constexpr float kGainMatchMinGain = 0.50118723f; // -6 dB
+constexpr float kGainMatchMaxGain = 1.99526231f; // +6 dB
+constexpr float kGainMatchPeakCeiling = 0.98f;
+constexpr float kGainMatchBlockSmoothing = 0.12f;
+constexpr double kGainMatchRmsFloor = 1.0e-5;
+
+float gain_match_target(
+    const audio_sample* original,
+    const std::vector<float>& rendered) {
+
+    if (!stem_gain_match::enabled() ||
+        original == nullptr ||
+        rendered.empty()) {
+        return 1.0f;
+    }
+
+    double original_energy = 0.0;
+    double stem_energy = 0.0;
+    float stem_peak = 0.0f;
+    size_t valid = 0;
+
+    for (size_t i = 0; i < rendered.size(); ++i) {
+        const double o = static_cast<double>(original[i]);
+        const double s = static_cast<double>(rendered[i]);
+        if (!std::isfinite(o) || !std::isfinite(s)) continue;
+
+        original_energy += o * o;
+        stem_energy += s * s;
+        stem_peak = (std::max)(stem_peak, static_cast<float>(std::abs(s)));
+        ++valid;
+    }
+
+    if (valid == 0) return 1.0f;
+
+    const double original_rms = std::sqrt(original_energy / static_cast<double>(valid));
+    const double stem_rms = std::sqrt(stem_energy / static_cast<double>(valid));
+
+    if (original_rms < kGainMatchRmsFloor ||
+        stem_rms < kGainMatchRmsFloor) {
+        return 1.0f;
+    }
+
+    float desired = static_cast<float>(original_rms / stem_rms);
+    desired = std::clamp(desired, kGainMatchMinGain, kGainMatchMaxGain);
+
+    if (stem_peak > 1.0e-6f) {
+        const float peak_limited = kGainMatchPeakCeiling / stem_peak;
+        if (peak_limited < desired) desired = (std::max)(0.0f, peak_limited);
+    }
+
+    return desired;
+}
 // Spectral Waveform now explicitly returns scrub transport to HOLD after real
 // mouse motion stops. Keep this slightly longer timeout as a safety net only.
 constexpr ULONGLONG kScrubAudibleSafetyMs = 320;
@@ -3232,6 +3292,13 @@ public:
         std::vector<audio_sample> output(
             rendered.size());
 
+        const float raw_gain_target = gain_match_target(original, rendered);
+        const float gain_start = m_gainMatchCurrent;
+        const float gain_end = stem_gain_match::enabled()
+            ? gain_start +
+                (raw_gain_target - gain_start) * kGainMatchBlockSmoothing
+            : 1.0f;
+
         const size_t fade_frames =
             static_cast<size_t>(
                 kSwitchFadeSeconds *
@@ -3243,6 +3310,12 @@ public:
              ++f) {
 
             float mix = 1.0f;
+
+            const float gain_alpha = frames > 0
+                ? static_cast<float>(f + 1) / static_cast<float>(frames)
+                : 1.0f;
+            const float stem_gain =
+                gain_start + (gain_end - gain_start) * gain_alpha;
 
             if (!m_using_stem &&
                 fade_frames > 0 &&
@@ -3265,7 +3338,7 @@ public:
                     ch;
 
                 const float stem_sample =
-                    rendered[i];
+                    rendered[i] * stem_gain;
 
                 const float original_sample =
                     static_cast<float>(
@@ -3291,6 +3364,7 @@ public:
             chunk->get_channel_config());
 
         m_using_stem = true;
+        m_gainMatchCurrent = gain_end;
 
         m_position_seconds +=
             static_cast<double>(
@@ -3323,6 +3397,7 @@ public:
         m_transportTailValid = false;
         m_scrubRateValid = false;
         m_scrubPreviousRate = 0.0;
+        m_gainMatchCurrent = 1.0f;
     }
 
     double get_latency() override {
@@ -3347,6 +3422,7 @@ private:
         m_scrubRateValid = false;
         m_scrubPreviousRate = 0.0;
         m_scrubRenderPosition = 0.0;
+        m_gainMatchCurrent = 1.0f;
     }
 
     bool m_have_position = false;
@@ -3361,6 +3437,7 @@ private:
     bool m_scrubRateValid = false;
     double m_scrubPreviousRate = 0.0;
     double m_scrubRenderPosition = 0.0;
+    float m_gainMatchCurrent = 1.0f;
 };
 
 static dsp_factory_t<stem_dsp>
