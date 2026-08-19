@@ -1,0 +1,1 @@
+Verify the promoted 2.7.0 stable source.
