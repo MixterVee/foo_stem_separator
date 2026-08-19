@@ -885,6 +885,30 @@ static contextmenu_group_popup_factory g_stem_cache_size_context_group_factory(
     "Maximum Cache Size",
     20);
 
+static const GUID g_stem_blend_context_group =
+    {0x72a4f1e1,0x4ad3,0x4bb6,{0x98,0x2d,0x7f,0x42,0x31,0x90,0x45,0x21}};
+static contextmenu_group_popup_factory g_stem_blend_context_group_factory(
+    g_stem_blend_context_group,
+    g_stem_separator_context_group,
+    "Stem Blend",
+    20);
+
+static const GUID g_stem_blend_vocal_context_group =
+    {0x72a4f1e2,0x4ad3,0x4bb6,{0x98,0x2d,0x7f,0x42,0x31,0x90,0x45,0x22}};
+static contextmenu_group_popup_factory g_stem_blend_vocal_context_group_factory(
+    g_stem_blend_vocal_context_group,
+    g_stem_blend_context_group,
+    "Vocals",
+    0);
+
+static const GUID g_stem_blend_instrumental_context_group =
+    {0x72a4f1e3,0x4ad3,0x4bb6,{0x98,0x2d,0x7f,0x42,0x31,0x90,0x45,0x23}};
+static contextmenu_group_popup_factory g_stem_blend_instrumental_context_group_factory(
+    g_stem_blend_instrumental_context_group,
+    g_stem_blend_context_group,
+    "Instrumental",
+    10);
+
 class stem_cache_context_menu : public contextmenu_item_simple {
 public:
     GUID get_parent() override { return g_stem_cache_context_group; }
@@ -1057,6 +1081,105 @@ public:
 static contextmenu_item_factory_t<stem_cache_size_context_menu>
     g_stem_cache_size_context_menu;
 
+
+class stem_blend_vocal_context_menu : public contextmenu_item_simple {
+public:
+    GUID get_parent() override { return g_stem_blend_vocal_context_group; }
+
+    static int level_for(unsigned index) {
+        static const int levels[] = {0, 25, 50, 75, 100};
+        return levels[index < 5 ? index : 4];
+    }
+
+    unsigned get_num_items() override { return 5; }
+
+    void get_item_name(unsigned index, pfc::string_base& out) override {
+        const int value = level_for(index);
+        pfc::string_formatter text;
+        text << value << "%";
+        if (stemmode::vocal_percent() == value) text << " (current)";
+        out = text;
+    }
+
+    GUID get_item_guid(unsigned index) override {
+        static const GUID ids[5] = {
+            {0xa92a1030,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x30}},
+            {0xa92a1031,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x31}},
+            {0xa92a1032,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x32}},
+            {0xa92a1033,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x33}},
+            {0xa92a1034,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x34}}
+        };
+        return ids[index < 5 ? index : 4];
+    }
+
+    bool get_item_description(unsigned, pfc::string_base& out) override {
+        out = "Set the vocal level for Stem Blend. Selecting a level activates Blend mode.";
+        return true;
+    }
+
+    void context_command(unsigned index, metadb_handle_list_cref, const GUID&) override {
+        const int value = level_for(index);
+        stemmode::set_vocal_percent(value);
+        stemmode::set(stemmode::mode::blend);
+        pfc::string_formatter msg;
+        msg << "Stem Blend: vocals " << value << "% / instrumental "
+            << stemmode::instrumental_percent() << "%";
+        console::print(msg);
+    }
+};
+
+static contextmenu_item_factory_t<stem_blend_vocal_context_menu>
+    g_stem_blend_vocal_context_menu;
+
+class stem_blend_instrumental_context_menu : public contextmenu_item_simple {
+public:
+    GUID get_parent() override { return g_stem_blend_instrumental_context_group; }
+
+    static int level_for(unsigned index) {
+        static const int levels[] = {0, 25, 50, 75, 100};
+        return levels[index < 5 ? index : 4];
+    }
+
+    unsigned get_num_items() override { return 5; }
+
+    void get_item_name(unsigned index, pfc::string_base& out) override {
+        const int value = level_for(index);
+        pfc::string_formatter text;
+        text << value << "%";
+        if (stemmode::instrumental_percent() == value) text << " (current)";
+        out = text;
+    }
+
+    GUID get_item_guid(unsigned index) override {
+        static const GUID ids[5] = {
+            {0xa92a1040,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x40}},
+            {0xa92a1041,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x41}},
+            {0xa92a1042,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x42}},
+            {0xa92a1043,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x43}},
+            {0xa92a1044,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x44}}
+        };
+        return ids[index < 5 ? index : 4];
+    }
+
+    bool get_item_description(unsigned, pfc::string_base& out) override {
+        out = "Set the instrumental level for Stem Blend. Selecting a level activates Blend mode.";
+        return true;
+    }
+
+    void context_command(unsigned index, metadb_handle_list_cref, const GUID&) override {
+        const int value = level_for(index);
+        stemmode::set_instrumental_percent(value);
+        stemmode::set(stemmode::mode::blend);
+        pfc::string_formatter msg;
+        msg << "Stem Blend: vocals " << stemmode::vocal_percent()
+            << "% / instrumental " << value << "%";
+        console::print(msg);
+    }
+};
+
+static contextmenu_item_factory_t<stem_blend_instrumental_context_menu>
+    g_stem_blend_instrumental_context_menu;
+
 class stem_mode_context_menu :
     public contextmenu_item_simple {
 
@@ -1069,6 +1192,7 @@ public:
         cmd_original = 0,
         cmd_vocals,
         cmd_instrumental,
+        cmd_blend,
         cmd_save_vocals,
         cmd_save_instrumental,
         cmd_save_vocals_mp3,
@@ -1097,6 +1221,14 @@ public:
         case cmd_instrumental:
             out = "Instrumental";
             break;
+
+        case cmd_blend: {
+            pfc::string_formatter text;
+            text << "Blend (V " << stemmode::vocal_percent()
+                 << "% / I " << stemmode::instrumental_percent() << "%)";
+            out = text;
+            break;
+        }
 
         case cmd_save_vocals:
             out = "Save Vocals as WAV...";
@@ -1132,6 +1264,7 @@ public:
             {0xa92a1001,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x01}},
             {0xa92a1002,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x02}},
             {0xa92a1003,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x03}},
+            {0xa92a1009,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x09}},
             {0xa92a1004,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x04}},
             {0xa92a1005,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x05}},
             {0xa92a1006,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x06}},
@@ -1157,6 +1290,10 @@ public:
 
         case cmd_instrumental:
             out = "Play the Spleeter accompaniment stem.";
+            return true;
+
+        case cmd_blend:
+            out = "Play the cached vocals and instrumental together using the current Stem Blend levels.";
             return true;
 
         case cmd_save_vocals:
@@ -1238,6 +1375,9 @@ public:
         }
         else if (index == cmd_instrumental) {
             next = stemmode::mode::instrumental;
+        }
+        else if (index == cmd_blend) {
+            next = stemmode::mode::blend;
         }
 
         stemmode::set(next);

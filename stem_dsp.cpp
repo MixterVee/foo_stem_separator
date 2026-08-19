@@ -957,6 +957,15 @@ public:
             return false;
         }
 
+        const float blend_vocal_gain =
+            mode == stemmode::mode::blend
+                ? static_cast<float>(stemmode::vocal_percent()) / 100.0f
+                : 0.0f;
+        const float blend_instrumental_gain =
+            mode == stemmode::mode::blend
+                ? static_cast<float>(stemmode::instrumental_percent()) / 100.0f
+                : 0.0f;
+
         g_dbg_render_attempts.fetch_add(1, std::memory_order_relaxed);
         g_dbg_last_render_start.store(start_seconds, std::memory_order_relaxed);
         g_dbg_last_source_rate.store(source_rate, std::memory_order_relaxed);
@@ -1105,44 +1114,38 @@ public:
                 return false;
             }
 
-            auto sample_from =
-                [mode, t](
+            auto sample_vector =
+                [t](
+                    const std::vector<float>& data,
                     const cache_segment& seg,
                     unsigned ch) -> float {
-
-                const std::vector<float>& data =
-                    mode == stemmode::mode::original
-                        ? seg.original
-                        : (mode == stemmode::mode::vocals
-                            ? seg.vocals
-                            : seg.instrumental);
 
                 const double rel =
                     t - seg.start_seconds;
 
                 double source_pos =
-                    rel *
-                    static_cast<double>(
-                        kCacheRate);
+                    rel * static_cast<double>(kCacheRate);
 
                 if (source_pos < 0.0) {
                     source_pos = 0.0;
                 }
 
                 const size_t total_frames =
-                    data.size() /
-                    kCacheChannels;
+                    data.size() / kCacheChannels;
 
                 if (total_frames == 0) {
                     return 0.0f;
                 }
 
-                source_pos = std::clamp(
-                    source_pos, 0.0, static_cast<double>(total_frames - 1));
+                const double max_pos =
+                    static_cast<double>(total_frames - 1);
+                if (source_pos > max_pos) {
+                    source_pos = max_pos;
+                }
 
                 const size_t i0 =
-                    static_cast<size_t>(std::floor(source_pos));
-                const size_t im1 = i0 > 0 ? i0 - 1 : 0;
+                    static_cast<size_t>(source_pos);
+                const size_t im1 = i0 > 0 ? i0 - 1 : i0;
                 const size_t i1 = (std::min)(i0 + 1, total_frames - 1);
                 const size_t i2 = (std::min)(i0 + 2, total_frames - 1);
                 const float frac = static_cast<float>(
@@ -1154,6 +1157,27 @@ public:
                     data[i0 * kCacheChannels + ch],
                     data[i1 * kCacheChannels + ch],
                     data[i2 * kCacheChannels + ch]);
+            };
+
+            auto sample_from =
+                [mode, blend_vocal_gain, blend_instrumental_gain, &sample_vector](
+                    const cache_segment& seg,
+                    unsigned ch) -> float {
+
+                if (mode == stemmode::mode::blend) {
+                    return
+                        sample_vector(seg.vocals, seg, ch) * blend_vocal_gain +
+                        sample_vector(seg.instrumental, seg, ch) * blend_instrumental_gain;
+                }
+
+                const std::vector<float>& data =
+                    mode == stemmode::mode::original
+                        ? seg.original
+                        : (mode == stemmode::mode::vocals
+                            ? seg.vocals
+                            : seg.instrumental);
+
+                return sample_vector(data, seg, ch);
             };
 
             for (unsigned ch = 0;
@@ -1255,7 +1279,11 @@ private:
     static bool segment_has_mode(const cache_segment& seg, stemmode::mode mode) {
         if (mode == stemmode::mode::original) return !seg.original.empty();
         if (mode == stemmode::mode::vocals) return !seg.vocals.empty();
-        return !seg.instrumental.empty();
+        if (mode == stemmode::mode::instrumental) return !seg.instrumental.empty();
+        if (mode == stemmode::mode::blend) {
+            return !seg.vocals.empty() && !seg.instrumental.empty();
+        }
+        return false;
     }
 
     bool range_ready_locked(stemmode::mode mode, double start_seconds, double end_seconds) const {
