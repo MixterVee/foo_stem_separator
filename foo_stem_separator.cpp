@@ -1,4 +1,4 @@
-﻿#include <foobar2000/SDK/foobar2000.h>
+#include <foobar2000/SDK/foobar2000.h>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -27,6 +27,7 @@
 
 #include "onnx_stem_engine.h"
 #include "stem_mode.h"
+#include "persistent_stem_cache.h"
 
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "mfplat.lib")
@@ -65,6 +66,40 @@ void toggle() {
 }
 
 } // namespace stem_precache
+
+namespace persistent_stem_cache {
+namespace {
+static const GUID g_cache_enabled_guid =
+    {0x8e6f2201,0x3aa6,0x43c8,{0x9d,0x2e,0x81,0x6d,0x61,0xa4,0x77,0x10}};
+static const GUID g_cache_max_gb_guid =
+    {0x8e6f2202,0x3aa6,0x43c8,{0x9d,0x2e,0x81,0x6d,0x61,0xa4,0x77,0x10}};
+
+cfg_int g_cache_enabled_cfg(g_cache_enabled_guid, 1);
+cfg_int g_cache_max_gb_cfg(g_cache_max_gb_guid, 10);
+} // namespace
+
+bool enabled() {
+    return static_cast<int>(g_cache_enabled_cfg.get()) != 0;
+}
+
+void set_enabled(bool value) {
+    g_cache_enabled_cfg = value ? 1 : 0;
+}
+
+unsigned max_gb() {
+    const int configured = static_cast<int>(g_cache_max_gb_cfg.get());
+    if (configured < 1) return 10u;
+    return static_cast<unsigned>(configured > 200 ? 200 : configured);
+}
+
+void set_max_gb(unsigned value) {
+    if (value < 1u) value = 1u;
+    if (value > 200u) value = 200u;
+    g_cache_max_gb_cfg = static_cast<int>(value);
+    detail::enforce_limit();
+}
+
+} // namespace persistent_stem_cache
 
 namespace {
 
@@ -833,6 +868,194 @@ static contextmenu_group_popup_factory
         contextmenu_groups::root,
         "Stem Separator",
         0);
+
+static const GUID g_stem_cache_context_group =
+    {0x72a4f1d1,0x4ad3,0x4bb6,{0x98,0x2d,0x7f,0x42,0x31,0x90,0x45,0x11}};
+static contextmenu_group_popup_factory g_stem_cache_context_group_factory(
+    g_stem_cache_context_group,
+    g_stem_separator_context_group,
+    "Cache Settings",
+    50);
+
+static const GUID g_stem_cache_size_context_group =
+    {0x72a4f1d2,0x4ad3,0x4bb6,{0x98,0x2d,0x7f,0x42,0x31,0x90,0x45,0x12}};
+static contextmenu_group_popup_factory g_stem_cache_size_context_group_factory(
+    g_stem_cache_size_context_group,
+    g_stem_cache_context_group,
+    "Maximum Cache Size",
+    20);
+
+class stem_cache_context_menu : public contextmenu_item_simple {
+public:
+    GUID get_parent() override { return g_stem_cache_context_group; }
+
+    enum command_id : unsigned {
+        cmd_enabled = 0,
+        cmd_status,
+        cmd_clear,
+        cmd_count
+    };
+
+    unsigned get_num_items() override { return cmd_count; }
+
+    void get_item_name(unsigned index, pfc::string_base& out) override {
+        if (index == cmd_enabled) {
+            out = persistent_stem_cache::enabled()
+                ? "Persistent Cache: ON"
+                : "Persistent Cache: OFF";
+            return;
+        }
+        if (index == cmd_status) {
+            const uint64_t bytes = persistent_stem_cache::current_size_bytes();
+            char text[96] = {};
+            const double gib = static_cast<double>(bytes) /
+                (1024.0 * 1024.0 * 1024.0);
+            if (gib >= 1.0) {
+                _snprintf_s(text, sizeof(text), _TRUNCATE,
+                    "Current Cache: %.2f GB", gib);
+            } else {
+                const double mib = static_cast<double>(bytes) /
+                    (1024.0 * 1024.0);
+                _snprintf_s(text, sizeof(text), _TRUNCATE,
+                    "Current Cache: %.1f MB", mib);
+            }
+            out = text;
+            return;
+        }
+        if (index == cmd_clear) {
+            out = "Clear Stem Cache...";
+            return;
+        }
+        out = "Cache Settings";
+    }
+
+    GUID get_item_guid(unsigned index) override {
+        static const GUID ids[cmd_count] = {
+            {0xa92a1011,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x11}},
+            {0xa92a1012,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x12}},
+            {0xa92a1013,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x13}}
+        };
+        return ids[index < cmd_count ? index : 0];
+    }
+
+    bool get_item_description(unsigned index, pfc::string_base& out) override {
+        if (index == cmd_enabled) {
+            out = "Enable or disable loading and saving the persistent disk stem cache.";
+            return true;
+        }
+        if (index == cmd_status) {
+            out = "Show the current persistent stem cache size and configured maximum.";
+            return true;
+        }
+        if (index == cmd_clear) {
+            out = "Delete all persistent stem cache files from disk.";
+            return true;
+        }
+        return false;
+    }
+
+    void context_command(unsigned index, metadb_handle_list_cref, const GUID&) override {
+        if (index == cmd_enabled) {
+            const bool next = !persistent_stem_cache::enabled();
+            persistent_stem_cache::set_enabled(next);
+            console::print(next
+                ? "Stem Separator: persistent cache ON"
+                : "Stem Separator: persistent cache OFF");
+            return;
+        }
+
+        if (index == cmd_status) {
+            const uint64_t bytes = persistent_stem_cache::current_size_bytes();
+            const double gib = static_cast<double>(bytes) /
+                (1024.0 * 1024.0 * 1024.0);
+            wchar_t message[512] = {};
+            _snwprintf_s(
+                message, _countof(message), _TRUNCATE,
+                L"Persistent Cache: %s\nCurrent size: %.2f GB\nMaximum size: %u GB\n\n"
+                L"When the cache exceeds the maximum, least-recently-used whole-track "
+                L"caches are removed until usage falls to about 80%% of the limit.",
+                persistent_stem_cache::enabled() ? L"ON" : L"OFF",
+                gib,
+                persistent_stem_cache::max_gb());
+            MessageBoxW(nullptr, message, L"Stem Separator - Cache Status",
+                MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+
+        if (index == cmd_clear) {
+            const int answer = MessageBoxW(
+                nullptr,
+                L"Delete all persistent stem cache files?\n\n"
+                L"The current track can continue from its in-memory cache. "
+                L"Newly processed stems may begin filling the disk cache again.",
+                L"Stem Separator - Clear Cache",
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+            if (answer != IDYES) return;
+
+            const bool ok = persistent_stem_cache::clear();
+            MessageBoxW(
+                nullptr,
+                ok ? L"Persistent stem cache cleared."
+                   : L"The persistent stem cache could not be completely cleared.",
+                L"Stem Separator",
+                MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONWARNING));
+            return;
+        }
+    }
+};
+
+static contextmenu_item_factory_t<stem_cache_context_menu>
+    g_stem_cache_context_menu;
+
+class stem_cache_size_context_menu : public contextmenu_item_simple {
+public:
+    GUID get_parent() override { return g_stem_cache_size_context_group; }
+
+    static unsigned size_for(unsigned index) {
+        static const unsigned sizes[] = {2, 5, 10, 20, 50, 100};
+        return sizes[index < 6 ? index : 2];
+    }
+
+    unsigned get_num_items() override { return 6; }
+
+    void get_item_name(unsigned index, pfc::string_base& out) override {
+        const unsigned value = size_for(index);
+        pfc::string_formatter text;
+        text << value << " GB";
+        if (persistent_stem_cache::max_gb() == value) text << " (current)";
+        out = text;
+    }
+
+    GUID get_item_guid(unsigned index) override {
+        static const GUID ids[6] = {
+            {0xa92a1021,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x21}},
+            {0xa92a1022,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x22}},
+            {0xa92a1023,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x23}},
+            {0xa92a1024,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x24}},
+            {0xa92a1025,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x25}},
+            {0xa92a1026,0xd1f0,0x4ae1,{0xa0,0x11,0x31,0x10,0x42,0x00,0x00,0x26}}
+        };
+        return ids[index < 6 ? index : 2];
+    }
+
+    bool get_item_description(unsigned, pfc::string_base& out) override {
+        out = "Set the maximum size of the persistent stem cache. "
+              "If necessary, old track caches are removed immediately.";
+        return true;
+    }
+
+    void context_command(unsigned index, metadb_handle_list_cref, const GUID&) override {
+        const unsigned value = size_for(index);
+        persistent_stem_cache::set_max_gb(value);
+        pfc::string_formatter msg;
+        msg << "Stem Separator: persistent cache maximum set to "
+            << value << " GB";
+        console::print(msg);
+    }
+};
+
+static contextmenu_item_factory_t<stem_cache_size_context_menu>
+    g_stem_cache_size_context_menu;
 
 class stem_mode_context_menu :
     public contextmenu_item_simple {

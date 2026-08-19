@@ -32,8 +32,7 @@ constexpr uint32_t kVersion = 2;
 constexpr uint32_t kRate = 44100;
 constexpr uint32_t kChannels = 2;
 constexpr uint64_t kMaxSegmentFrames = static_cast<uint64_t>(kRate) * 10u;
-constexpr uint64_t kMaxCacheBytes = 10ull * 1024ull * 1024ull * 1024ull;
-constexpr uint64_t kTrimCacheBytes = 8ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t kBytesPerGiB = 1024ull * 1024ull * 1024ull;
 constexpr ULONGLONG kCleanupIntervalMs = 60ull * 1000ull;
 constexpr wchar_t kAccessMarkerName[] = L".access";
 
@@ -42,6 +41,14 @@ constexpr uint32_t kCodecXpressHuffDeltaFloat = 1;
 
 std::mutex g_cache_mutex;
 ULONGLONG g_last_cleanup_tick = 0;
+
+uint64_t configured_max_bytes() {
+    return max_bytes();
+}
+
+uint64_t configured_trim_bytes() {
+    return configured_max_bytes() * 4ull / 5ull;
+}
 
 struct source_fingerprint {
     uint64_t path_hash = 0;
@@ -206,7 +213,7 @@ void prune_cache_locked(const fs::path& protected_dir) {
         tracks.push_back(std::move(info));
     }
 
-    if (total_bytes <= kMaxCacheBytes) return;
+    if (total_bytes <= configured_max_bytes()) return;
 
     std::sort(tracks.begin(), tracks.end(), [](const track_cache_info& a, const track_cache_info& b) {
         return a.last_access < b.last_access;
@@ -215,7 +222,7 @@ void prune_cache_locked(const fs::path& protected_dir) {
     const fs::path protected_normal = protected_dir.lexically_normal();
 
     for (const auto& track : tracks) {
-        if (total_bytes <= kTrimCacheBytes) break;
+        if (total_bytes <= configured_trim_bytes()) break;
         if (!protected_dir.empty() && track.path.lexically_normal() == protected_normal) continue;
 
         const uint64_t removed_bytes = track.bytes;
@@ -419,9 +426,59 @@ bool decode_v2_payload(
 
 } // namespace
 
+uint64_t max_bytes() {
+    return static_cast<uint64_t>(max_gb()) * kBytesPerGiB;
+}
+
+namespace detail {
+void enforce_limit() {
+    std::lock_guard<std::mutex> guard(g_cache_mutex);
+    g_last_cleanup_tick = 0;
+    prune_cache_locked({});
+}
+} // namespace detail
+
+uint64_t current_size_bytes() {
+    std::lock_guard<std::mutex> guard(g_cache_mutex);
+    const fs::path root = root_path();
+    if (root.empty()) return 0;
+
+    std::error_code ec;
+    if (!fs::exists(root, ec) || ec) return 0;
+
+    uint64_t total = 0;
+    for (fs::recursive_directory_iterator it(root, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            ec.clear();
+            continue;
+        }
+        const uint64_t bytes = static_cast<uint64_t>(it->file_size(ec));
+        if (!ec) total += bytes;
+        ec.clear();
+    }
+    return total;
+}
+
+bool clear() {
+    std::lock_guard<std::mutex> guard(g_cache_mutex);
+    const fs::path root = root_path();
+    if (root.empty()) return false;
+
+    std::error_code ec;
+    if (fs::exists(root, ec) && !ec) {
+        fs::remove_all(root, ec);
+        if (ec) return false;
+    }
+    g_last_cleanup_tick = 0;
+    return true;
+}
+
 std::vector<segment> load(const std::wstring& source_path) {
     std::lock_guard<std::mutex> guard(g_cache_mutex);
     std::vector<segment> out;
+
+    if (!enabled()) return out;
 
     source_fingerprint fp;
     if (!fingerprint(source_path, fp)) return out;
@@ -520,6 +577,8 @@ bool save(
     const std::vector<float>& instrumental) {
 
     std::lock_guard<std::mutex> guard(g_cache_mutex);
+
+    if (!enabled()) return false;
 
     if (source_path.empty() || vocals.empty() || vocals.size() != instrumental.size()) {
         return false;

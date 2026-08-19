@@ -12,6 +12,20 @@ struct segment {
     std::vector<float> instrumental;
 };
 
+bool enabled();
+void set_enabled(bool value);
+
+unsigned max_gb();
+uint64_t max_bytes();
+void set_max_gb(unsigned value);
+
+uint64_t current_size_bytes();
+bool clear();
+
+namespace detail {
+void enforce_limit();
+}
+
 std::vector<segment> load(const std::wstring& source_path);
 
 bool save(
