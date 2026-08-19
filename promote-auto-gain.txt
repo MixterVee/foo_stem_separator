@@ -1,0 +1,1 @@
+Promote the user-tested Automatic Gain Matching implementation to stable 2.8.0.
