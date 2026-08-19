@@ -1,0 +1,83 @@
+name: Verify Stem Blend v1
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout test branch
+        uses: actions/checkout@v4
+
+      - name: Apply Stem Blend patch
+        shell: pwsh
+        run: |
+          python .\patch-stem-blend-v1.py
+
+      - name: Add Visual Studio 2022 MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+
+      - name: Locate Visual Studio 2022
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -version "[17.0,18.0)" -products * -property installationPath
+          if (-not $vsPath) { throw "VS2022 not found." }
+          "VS2022_PATH=$vsPath" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install ATL
+        shell: pwsh
+        run: |
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $args = @(
+            "modify",
+            "--installPath", "`"$env:VS2022_PATH`"",
+            "--add", "Microsoft.VisualStudio.Component.VC.ATL",
+            "--quiet",
+            "--norestart"
+          )
+          $p = Start-Process $installer -ArgumentList $args -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "ATL install failed: $($p.ExitCode)"
+          }
+          $atl = Get-ChildItem "$env:VS2022_PATH\VC\Tools\MSVC" -Filter atlbase.h -Recurse | Select-Object -First 1
+          if (-not $atl) { throw "atlbase.h not found." }
+          "ATL_INCLUDE=$($atl.Directory.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install WTL
+        uses: nuget/setup-nuget@v2
+
+      - name: Locate WTL
+        shell: pwsh
+        run: |
+          $packages = "$env:RUNNER_TEMP\packages"
+          nuget install wtl -Version 10.0.10320 -OutputDirectory $packages -NonInteractive
+          $h = Get-ChildItem $packages -Filter atlapp.h -Recurse | Select-Object -First 1
+          if (-not $h) { throw "WTL not found." }
+          "WTL_INCLUDE=$($h.Directory.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Get foobar2000 SDK
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git "$env:RUNNER_TEMP\foobar2000-sdk"
+
+      - name: Compile Stem Blend test DLL
+        shell: pwsh
+        run: |
+          .\build-ci-v12.ps1 `
+            -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk" `
+            -RepoRoot "$env:GITHUB_WORKSPACE" `
+            -WtlInclude "$env:WTL_INCLUDE" `
+            -AtlInclude "$env:ATL_INCLUDE"
+          if (!(Test-Path "dist\foo_stem_separator.dll")) { throw "Built DLL not found." }
+
+      - name: Upload test DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: foo_stem_separator-2.7.0-test1-stem-blend
+          path: dist/foo_stem_separator.dll
