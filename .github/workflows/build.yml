@@ -148,7 +148,7 @@ jobs:
         run: |
           $dist = "$env:GITHUB_WORKSPACE\dist"
           Set-Content "$dist\BACKENDS.txt" @(
-            "Stem Separator 2.5.0 dynamic DirectML processing backend",
+            "Stem Separator 2.6.0 persistent cache + dynamic DirectML processing backend",
             "Enumerates every hardware DXGI adapter and benchmarks each DirectML backend.",
             "GPU preference is saved by hardware identity rather than adapter index.",
             "Missing or failed preferred GPU falls back to CPU automatically.",

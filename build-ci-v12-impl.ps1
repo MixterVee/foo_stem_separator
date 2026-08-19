@@ -15,19 +15,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 Write-Host "==============================================="
-Write-Host "V11 - VS2022 v143 + WTL 10.0.10320 + USER32"
+Write-Host "V12 - NATIVE ONNX DSP PROTOTYPE"
 Write-Host "==============================================="
-Write-Host "SDK root:    $SdkRoot"
-Write-Host "Repo root:   $RepoRoot"
-Write-Host "WTL include: $WtlInclude"
-Write-Host "ATL include: $AtlInclude"
-
-if (-not (Test-Path (Join-Path $WtlInclude "atlapp.h"))) {
-    throw "WTL atlapp.h not found in: $WtlInclude"
-}
-if (-not (Test-Path (Join-Path $AtlInclude "atlbase.h"))) {
-    throw "ATL atlbase.h not found in: $AtlInclude"
-}
 
 $sampleProject = Get-ChildItem -Path $SdkRoot -Filter "foo_sample.vcxproj" -Recurse |
     Select-Object -First 1
@@ -39,10 +28,26 @@ if (-not $sampleProject) {
 $sampleDir = $sampleProject.Directory.FullName
 $projectPath = $sampleProject.FullName
 
-Write-Host "Using sample project:"
-Write-Host $projectPath
+$cppFiles = @(
+    "foo_stem_separator.cpp",
+    "stem_mode.cpp",
+    "onnx_stem_engine.cpp",
+    "persistent_stem_cache.cpp",
+    "stem_dsp.cpp",
+    "stem_waveform_provider.cpp",
+    "stem_benchmark.cpp"
+)
 
-foreach ($name in @("foo_stem_separator.cpp", "stem_engine.cpp", "stem_engine.h")) {
+$hFiles = @(
+    "stem_mode.h",
+    "onnx_stem_engine.h",
+    "persistent_stem_cache.h",
+    "stem_waveform_provider.h",
+    "stem_transport_service.h",
+    "stem_processing_status_service.h"
+)
+
+foreach ($name in ($cppFiles + $hFiles)) {
     $src = Join-Path $RepoRoot $name
     if (-not (Test-Path $src)) {
         throw "Missing repository source: $name"
@@ -50,7 +55,7 @@ foreach ($name in @("foo_stem_separator.cpp", "stem_engine.cpp", "stem_engine.h"
     Copy-Item $src (Join-Path $sampleDir $name) -Force
 }
 
-$backup = "$projectPath.v11backup"
+$backup = "$projectPath.v12backup"
 Copy-Item $projectPath $backup -Force
 
 try {
@@ -68,7 +73,7 @@ try {
 
     $group = $xml.CreateElement("ItemGroup", $nsUri)
 
-    foreach ($cpp in @("foo_stem_separator.cpp", "stem_engine.cpp")) {
+    foreach ($cpp in $cppFiles) {
         $node = $xml.CreateElement("ClCompile", $nsUri)
         $node.SetAttribute("Include", $cpp)
 
@@ -79,9 +84,12 @@ try {
         [void]$group.AppendChild($node)
     }
 
-    $headerNode = $xml.CreateElement("ClInclude", $nsUri)
-    $headerNode.SetAttribute("Include", "stem_engine.h")
-    [void]$group.AppendChild($headerNode)
+    foreach ($h in $hFiles) {
+        $node = $xml.CreateElement("ClInclude", $nsUri)
+        $node.SetAttribute("Include", $h)
+        [void]$group.AppendChild($node)
+    }
+
     [void]$xml.Project.AppendChild($group)
 
     foreach ($idg in @($xml.SelectNodes("//m:ItemDefinitionGroup", $ns))) {
@@ -101,16 +109,15 @@ try {
 
     foreach ($link in @($xml.SelectNodes("//m:ItemDefinitionGroup/m:Link", $ns))) {
         $deps = $link.SelectSingleNode("m:AdditionalDependencies", $ns)
-        $needed = "user32.lib;bcrypt.lib;shell32.lib;ole32.lib"
+        $needed = "user32.lib;shell32.lib;ole32.lib"
 
         if (-not $deps) {
             $deps = $xml.CreateElement("AdditionalDependencies", $nsUri)
             [void]$link.AppendChild($deps)
             $deps.InnerText = "$needed;%(AdditionalDependencies)"
-        }
-        else {
+        } else {
             $existing = $deps.InnerText
-            foreach ($lib in @("user32.lib","bcrypt.lib","shell32.lib","ole32.lib")) {
+            foreach ($lib in @("user32.lib","shell32.lib","ole32.lib")) {
                 if ($existing -notmatch [regex]::Escape($lib)) {
                     $existing = "$lib;$existing"
                 }
@@ -139,9 +146,6 @@ try {
         $env:CL = $forced + " " + $env:CL
     }
 
-    Write-Host "CL:"
-    Write-Host $env:CL
-
     msbuild $projectPath `
         /m `
         /t:Build `
@@ -163,14 +167,14 @@ try {
     }
 
     $dist = Join-Path $RepoRoot "dist"
+    if (Test-Path $dist) {
+        Remove-Item $dist -Recurse -Force
+    }
     New-Item -ItemType Directory -Force $dist | Out-Null
-    $final = Join-Path $dist "foo_stem_separator.dll"
-    Copy-Item $dll.FullName $final -Force
 
-    Write-Host "==============================================="
-    Write-Host "SUCCESS - DLL CREATED"
-    Write-Host $final
-    Write-Host "==============================================="
+    Copy-Item $dll.FullName (Join-Path $dist "foo_stem_separator.dll") -Force
+
+    Write-Host "Component DLL created."
 }
 finally {
     if (Test-Path $backup) {

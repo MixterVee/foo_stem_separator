@@ -1,28 +1,18 @@
 # Build notes
 
-1. Download foobar2000 SDK 2025-03-07 from the official foobar2000 SDK page.
-2. Copy this project's `src` folder beside/into a normal SDK component sample.
-3. Use the SDK's x64 Visual Studio 2022 configuration.
-4. Add:
-   - foo_stem_separator.cpp
-   - stem_engine.cpp
-   - stem_engine.h
-5. Link:
-   - bcrypt.lib
-   - shell32.lib
-6. Build as `foo_stem_separator.dll`.
+The supported release build is the GitHub Actions workflow:
 
-## One remaining SDK integration point
+`.github/workflows/build.yml`
 
-The Demucs/cache engine is independent of foobar2000 and implemented.
+It targets Windows x64 / Visual Studio 2022 and performs the complete package build:
 
-The final build needs the exact current-SDK call for:
-- posting the completed worker result to the foobar main thread;
-- resolving the generated WAV into a metadb handle;
-- adding it to the active playlist;
-- starting playback.
+1. obtains the foobar2000 SDK;
+2. builds `foo_stem_separator.dll` using `build-ci-v12.ps1`;
+3. builds sherpa-onnx 1.13.4 with DirectML support;
+4. bundles `sherpa-onnx-c-api.dll`, `onnxruntime.dll`, and `DirectML.dll`;
+5. downloads the Spleeter two-stem FP16 models;
+6. packages the stable `.fb2k-component` artifact.
 
-That section is marked `TODO FINAL SDK WIRING` in `foo_stem_separator.cpp`.
+`foo_stem_separator.cpp` is a thin release-metadata wrapper around the tested `foo_stem_separator_impl.cpp` implementation. Likewise, `build-ci-v12.ps1` prepares the implementation include and delegates the proven build logic to `build-ci-v12-impl.ps1`.
 
-It should be filled using the current SDK's own sample code rather than using
-an old API signature from memory.
+Earlier numbered build scripts were development snapshots and are intentionally not part of the stable tree.
