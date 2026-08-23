@@ -938,7 +938,8 @@ public:
 
         std::lock_guard<std::mutex> lock(m_mutex);
         for (const auto& seg_ptr : m_segments) {
-                const cache_segment& seg = *seg_ptr;
+            const cache_segment& seg = *seg_ptr;
+            if (seg.external_waveform) continue;
             if (!segment_has_mode(seg, mode)) continue;
             if (position_seconds >= seg.start_seconds &&
                 position_seconds < seg.end_seconds) {
@@ -972,7 +973,11 @@ public:
                 ? position_seconds
                 : position_seconds + margin);
 
-        if (range_ready_locked(mode, need_start, need_end)) return;
+        if (original_preview) {
+            if (range_ready_locked(mode, need_start, need_end)) return;
+        } else {
+            if (internal_stem_range_ready_locked(need_start, need_end)) return;
+        }
 
         // Coalesce scrub requests: a slow Spleeter job must never build a queue of
         // obsolete mouse positions. The newest transport target goes to the front.
@@ -2867,6 +2872,9 @@ public:
             m_have_position = true;
             m_using_stem = false;
             m_precache_handled = false;
+            m_seekStemGuard =
+                stemmode::get() != stemmode::mode::original &&
+                !cache_manager().is_track_start_generation(m_generation);
         }
 
         const stemmode::mode mode =
@@ -3178,11 +3186,12 @@ public:
                 cache_manager().request_transport(m_position_seconds, false);
                 std::vector<float> preview;
                 if (cache_manager().render(
-                        mode, m_position_seconds, rate, frames, preview, 1.0) &&
+                        mode, m_position_seconds, rate, frames, preview, 1.0, false) &&
                     preview.size() == frames * kCacheChannels) {
                     write_preview(preview);
                     transport().finish_release();
                     m_using_stem = true;
+                    m_seekStemGuard = false;
                 } else {
                     // Stem-safe release: wait silently rather than leaking Original.
                     write_silence();
@@ -3240,6 +3249,7 @@ public:
             stemmode::mode::original) {
 
             m_precache_handled = true;
+            m_seekStemGuard = false;
 
             m_position_seconds +=
                 static_cast<double>(
@@ -3275,10 +3285,22 @@ public:
                 frames *
                 kCacheChannels) {
 
-            // Critical V23 behavior:
-            // NEVER stall foobar waiting for Spleeter.
-            // After a seek we temporarily play the original mix until
-            // the position-indexed cache catches up.
+            // Never stall foobar waiting for Spleeter. Ordinary forward-playback
+            // misses retain the historical Original fallback, but immediately
+            // after a seek a selected stem must be fail-closed: silence is safer
+            // than briefly exposing the full mix. The seek worker is already
+            // queued by live_cache_manager::seek().
+            if (m_seekStemGuard) {
+                std::vector<audio_sample> zeros(
+                    frames * kCacheChannels, 0);
+                chunk->set_data(
+                    zeros.data(),
+                    frames,
+                    channels,
+                    rate,
+                    chunk->get_channel_config());
+            }
+
             m_position_seconds +=
                 static_cast<double>(
                     frames) /
@@ -3299,9 +3321,15 @@ public:
                 (raw_gain_target - gain_start) * kGainMatchBlockSmoothing
             : 1.0f;
 
+        const bool seek_stem_handoff = m_seekStemGuard;
         const size_t fade_frames =
             static_cast<size_t>(
                 kSwitchFadeSeconds *
+                static_cast<double>(
+                    rate));
+        const size_t seek_fade_frames =
+            static_cast<size_t>(
+                kFirstBlockFadeSeconds *
                 static_cast<double>(
                     rate));
 
@@ -3317,7 +3345,8 @@ public:
             const float stem_gain =
                 gain_start + (gain_end - gain_start) * gain_alpha;
 
-            if (!m_using_stem &&
+            if (!seek_stem_handoff &&
+                !m_using_stem &&
                 fade_frames > 0 &&
                 f < fade_frames) {
 
@@ -3337,18 +3366,29 @@ public:
                         kCacheChannels +
                     ch;
 
-                const float stem_sample =
+                float stem_sample =
                     rendered[i] * stem_gain;
+
+                if (seek_stem_handoff &&
+                    seek_fade_frames > 0 &&
+                    f < seek_fade_frames) {
+                    const float seek_gain =
+                        static_cast<float>(f + 1) /
+                        static_cast<float>(seek_fade_frames);
+                    stem_sample *= seek_gain;
+                }
 
                 const float original_sample =
                     static_cast<float>(
                         original[i]);
 
                 const float v =
-                    original_sample *
-                        (1.0f - mix) +
-                    stem_sample *
-                        mix;
+                    seek_stem_handoff
+                        ? stem_sample
+                        : original_sample *
+                            (1.0f - mix) +
+                          stem_sample *
+                            mix;
 
                 output[i] =
                     static_cast<audio_sample>(
@@ -3364,6 +3404,7 @@ public:
             chunk->get_channel_config());
 
         m_using_stem = true;
+        m_seekStemGuard = false;
         m_gainMatchCurrent = gain_end;
 
         m_position_seconds +=
@@ -3394,6 +3435,7 @@ public:
         m_have_position = false;
         m_using_stem = false;
         m_precache_handled = false;
+        m_seekStemGuard = false;
         m_transportTailValid = false;
         m_scrubRateValid = false;
         m_scrubPreviousRate = 0.0;
@@ -3414,6 +3456,7 @@ private:
         m_have_position = false;
         m_using_stem = false;
         m_precache_handled = false;
+        m_seekStemGuard = false;
         m_position_seconds = 0.0;
         m_generation = 0;
         m_transportTailValid = false;
@@ -3428,6 +3471,7 @@ private:
     bool m_have_position = false;
     bool m_using_stem = false;
     bool m_precache_handled = false;
+    bool m_seekStemGuard = false;
 
     uint64_t m_generation = 0;
     double m_position_seconds = 0.0;

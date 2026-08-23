@@ -10,7 +10,7 @@
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "2.8.0 Stable Automatic Gain Matching",
+    "2.8.1 Stable Seek Stem Guard",
     "Native ONNX vocals / instrumental separation.\n"
     "Live Original / Vocals / Instrumental switching with seek-safe cached playback and clean WAV/MP3 export.\n"
     "Lossless compressed persistent stem cache with configurable size, cache status/clear controls, start pre-cache, and dynamic DirectML/CPU backend benchmarking."
