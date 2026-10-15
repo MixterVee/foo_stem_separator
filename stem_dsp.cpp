@@ -558,6 +558,11 @@ public:
         std::lock_guard<std::mutex> lock(
             m_mutex);
 
+        const bool same_track =
+            !path.empty() &&
+            !m_path.empty() &&
+            _wcsicmp(path.c_str(), m_path.c_str()) == 0;
+
         ++m_generation;
 
         m_track_start_generation =
@@ -566,18 +571,49 @@ public:
         m_path = path;
         m_anchor_seconds = 0.0;
 
-        m_segments.clear();
-        m_live_original.clear();
-        m_live_original_start_frame = 0;
+        // Any queued work belongs to the old playback generation. A restart of
+        // the SAME track must not throw away completed stem PCM: doing so forces
+        // ordinary playback to leak Original for a second or two while the
+        // persistent cache is restored again. Completed segments are
+        // position-indexed and remain valid when playback simply returns to 0:00.
         m_jobs.clear();
         m_job_pending = false;
 
+        if (same_track) {
+            m_live_original.clear();
+            m_live_original_start_frame = 0;
+
+            if (!m_path.empty()) {
+                const stemmode::mode mode = stemmode::get();
+                const bool warm_stems =
+                    mode != stemmode::mode::original || stem_precache::enabled();
+
+                if (warm_stems) {
+                    // If the already-resident stem cache does not cover the first
+                    // live block, queue only the missing work. Otherwise playback
+                    // can use the existing Vocal/Instrumental PCM immediately.
+                    if (!internal_stem_range_ready_locked(0.0, kCacheSeconds)) {
+                        queue_job_locked(0.0, true);
+                    }
+                } else {
+                    m_jobs.emplace_back(cache_job{
+                        m_generation, m_path, 0.0, true, false, false});
+                    m_job_pending = true;
+                }
+            }
+
+            m_ready_cv.notify_all();
+            m_cv.notify_one();
+            return;
+        }
+
+        m_segments.clear();
+        m_live_original.clear();
+        m_live_original_start_frame = 0;
+
         if (!m_path.empty()) {
-            // Persistent restore is a startup barrier. Do not queue live Spleeter
-            // work at the same time: compressed cache restore can take long enough
-            // for playback/mode switching to observe a half-initialized cache.
-            // The restore job publishes all disk segments atomically, then queues
-            // only whatever initial work is still missing.
+            // Persistent restore is a startup barrier for a genuinely different
+            // track. Publish restored segments atomically before live processing.
             m_jobs.emplace_back(cache_job{
                 m_generation, m_path, 0.0, false, false, false, true});
             m_job_pending = true;
