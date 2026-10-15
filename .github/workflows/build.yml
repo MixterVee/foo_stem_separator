@@ -250,8 +250,8 @@ jobs:
               $false)
             try {
               Get-ChildItem $stage -File -Recurse | Sort-Object FullName | ForEach-Object {
-                $relative = $_.FullName.Substring($stage.Length).TrimStart('\\','/')
-                $entryName = $relative.Replace('\\','/')
+                $relative = $_.FullName.Substring($stage.Length).TrimStart([char]92, [char]47)
+                $entryName = $relative.Replace([char]92, [char]47)
                 [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
                   $zip,
                   $_.FullName,
