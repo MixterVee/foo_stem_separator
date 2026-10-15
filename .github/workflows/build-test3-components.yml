@@ -1,0 +1,99 @@
+name: Build Test 3 Stem Separator components
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/win32-stem-blend-test3-x86-live-fallback
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Add Visual Studio 2022 MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+
+      - name: Locate Visual Studio 2022
+        shell: powershell
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -version "[17.0,18.0)" -products * -property installationPath
+          if (-not $vsPath) { throw "VS2022 not found." }
+          "VS2022_PATH=$vsPath" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install ATL for VS2022
+        shell: powershell
+        run: |
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $args = @(
+            "modify",
+            "--installPath", "`"$env:VS2022_PATH`"",
+            "--add", "Microsoft.VisualStudio.Component.VC.ATL",
+            "--quiet",
+            "--norestart"
+          )
+          $p = Start-Process $installer -ArgumentList $args -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "ATL install failed: $($p.ExitCode)"
+          }
+
+      - name: Find ATL
+        shell: powershell
+        run: |
+          $atl = Get-ChildItem "$env:VS2022_PATH\VC\Tools\MSVC" -Filter atlbase.h -Recurse | Select-Object -First 1
+          if (-not $atl) { throw "atlbase.h not found." }
+          "ATL_INCLUDE=$($atl.Directory.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install NuGet
+        uses: nuget/setup-nuget@v2
+
+      - name: Install WTL 10.0.10320
+        shell: powershell
+        run: |
+          $packages = "$env:RUNNER_TEMP\packages"
+          nuget install wtl -Version 10.0.10320 -OutputDirectory $packages -NonInteractive
+          $h = Get-ChildItem $packages -Filter atlapp.h -Recurse | Select-Object -First 1
+          if (-not $h) { throw "WTL not found." }
+          "WTL_INCLUDE=$($h.Directory.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Get foobar2000 SDKs
+        shell: powershell
+        run: |
+          git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git "$env:RUNNER_TEMP\foobar2000-sdk-x64"
+          git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git "$env:RUNNER_TEMP\foobar2000-sdk-x86"
+
+      - name: Build x64 component
+        shell: powershell
+        run: |
+          .\build-ci-v12.ps1 `
+            -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk-x64" `
+            -RepoRoot "$env:GITHUB_WORKSPACE" `
+            -WtlInclude "$env:WTL_INCLUDE" `
+            -AtlInclude "$env:ATL_INCLUDE" `
+            -Platform x64
+          New-Item -ItemType Directory -Force "out\x64" | Out-Null
+          Copy-Item "dist\foo_stem_separator.dll" "out\x64\foo_stem_separator.dll" -Force
+
+      - name: Build Win32 component
+        shell: powershell
+        run: |
+          .\build-ci-v12.ps1 `
+            -SdkRoot "$env:RUNNER_TEMP\foobar2000-sdk-x86" `
+            -RepoRoot "$env:GITHUB_WORKSPACE" `
+            -WtlInclude "$env:WTL_INCLUDE" `
+            -AtlInclude "$env:ATL_INCLUDE" `
+            -Platform Win32
+          New-Item -ItemType Directory -Force "out\x86" | Out-Null
+          Copy-Item "dist\foo_stem_separator.dll" "out\x86\foo_stem_separator.dll" -Force
+
+      - name: Upload Test 3 component DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: foo_stem_separator-2.8.2-test3-components
+          path: out/**
+          if-no-files-found: error
