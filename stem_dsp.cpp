@@ -2782,10 +2782,18 @@ public:
     }
 
     void on_playback_stop(
-        play_control::t_stop_reason) override {
+        play_control::t_stop_reason reason) override {
 
         transport().cancel();
-        cache_manager().stop();
+
+        // foobar sends stop_reason_starting_another before on_playback_new_track
+        // when a playlist item is started/restarted. Keep the current cache alive
+        // across that transition so new_track() can distinguish a same-track
+        // restart from a genuinely different file. A user stop, EOF with no
+        // immediate replacement, or shutdown still releases the cache normally.
+        if (reason != play_control::stop_reason_starting_another) {
+            cache_manager().stop();
+        }
     }
 
     void on_playback_seek(
