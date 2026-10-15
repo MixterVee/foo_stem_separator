@@ -107,7 +107,7 @@ try {
             $lang = $xml.CreateElement("LanguageStandard", $nsUri)
             [void]$cl.AppendChild($lang)
         }
-        $lang.InnerText = "stdcpp17"
+        $lang.InnerText = "stdcpp20"
     }
 
     foreach ($link in @($xml.SelectNodes("//m:ItemDefinitionGroup/m:Link", $ns))) {
@@ -155,7 +155,7 @@ try {
         /p:Configuration=Release `
         /p:Platform=$Platform `
         /p:PlatformToolset=v143 `
-        /p:LanguageStandard=stdcpp17 `
+        /p:LanguageStandard=stdcpp20 `
         /v:minimal
 
     if ($LASTEXITCODE -ne 0) {
