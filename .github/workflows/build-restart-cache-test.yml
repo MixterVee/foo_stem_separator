@@ -1,0 +1,76 @@
+name: Build Restart Cache Test
+
+on:
+  push:
+    branches:
+      - agent/restart-cache-test4
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
+
+      - name: Locate Visual Studio
+        shell: powershell
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -version "[17.0,18.0)" -products * -property installationPath
+          if (-not $vsPath) { throw "VS2022 not found." }
+          "VS2022_PATH=$vsPath" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install ATL
+        shell: powershell
+        run: |
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $p = Start-Process $installer -ArgumentList @(
+            "modify","--installPath","`"$env:VS2022_PATH`"",
+            "--add","Microsoft.VisualStudio.Component.VC.ATL",
+            "--quiet","--norestart") -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "ATL install failed." }
+
+      - name: Find ATL
+        shell: powershell
+        run: |
+          $atl = Get-ChildItem "$env:VS2022_PATH\VC\Tools\MSVC" -Filter atlbase.h -Recurse | Select-Object -First 1
+          if (-not $atl) { throw "atlbase.h not found." }
+          "ATL_INCLUDE=$($atl.Directory.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: nuget/setup-nuget@v2
+
+      - name: Install WTL
+        shell: powershell
+        run: |
+          nuget install wtl -Version 10.0.10320 -OutputDirectory "$env:RUNNER_TEMP\packages" -NonInteractive
+          $h = Get-ChildItem "$env:RUNNER_TEMP\packages" -Filter atlapp.h -Recurse | Select-Object -First 1
+          "WTL_INCLUDE=$($h.Directory.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Get SDKs
+        shell: powershell
+        run: |
+          git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git "$env:RUNNER_TEMP\sdk-x64"
+          git clone --depth 1 https://github.com/reupen/foobar2000-sdk-unmodified.git "$env:RUNNER_TEMP\sdk-x86"
+
+      - name: Build x64 component
+        shell: powershell
+        run: |
+          .\build-ci-v12.ps1 -SdkRoot "$env:RUNNER_TEMP\sdk-x64" -RepoRoot "$env:GITHUB_WORKSPACE" -WtlInclude "$env:WTL_INCLUDE" -AtlInclude "$env:ATL_INCLUDE" -Platform x64
+          New-Item -ItemType Directory -Force "out\x64" | Out-Null
+          Copy-Item "dist\foo_stem_separator.dll" "out\x64\foo_stem_separator.dll" -Force
+
+      - name: Build Win32 component
+        shell: powershell
+        run: |
+          .\build-ci-v12.ps1 -SdkRoot "$env:RUNNER_TEMP\sdk-x86" -RepoRoot "$env:GITHUB_WORKSPACE" -WtlInclude "$env:WTL_INCLUDE" -AtlInclude "$env:ATL_INCLUDE" -Platform Win32
+          New-Item -ItemType Directory -Force "out\x86" | Out-Null
+          Copy-Item "dist\foo_stem_separator.dll" "out\x86\foo_stem_separator.dll" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: foo_stem_separator-2.8.3-test1-components
+          path: out/**
