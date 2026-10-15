@@ -230,11 +230,57 @@ jobs:
             if (!(Test-Path $required)) { throw "Universal package missing: $required" }
           }
 
-          $zip = "$env:GITHUB_WORKSPACE\foo_stem_separator.zip"
           $component = "$env:GITHUB_WORKSPACE\foo_stem_separator.fb2k-component"
-          Remove-Item $zip,$component -Force -ErrorAction SilentlyContinue
-          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
-          Rename-Item $zip $component
+          Remove-Item $component -Force -ErrorAction SilentlyContinue
+
+          # Compress-Archive stores Windows-style backslashes in ZIP entry names.
+          # foobar2000 expects architecture selectors as POSIX-style paths such
+          # as x64/foo_stem_separator.dll. Create the archive with Python so
+          # every entry uses forward slashes exactly like the working universal
+          # Spectral Waveform package.
+          @'
+import os
+import zipfile
+
+stage = os.path.join(os.environ["GITHUB_WORKSPACE"], "package")
+out = os.path.join(os.environ["GITHUB_WORKSPACE"], "foo_stem_separator.fb2k-component")
+
+with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+    for root, dirs, files in os.walk(stage):
+        dirs.sort()
+        files.sort()
+        for name in files:
+            full = os.path.join(root, name)
+            arc = os.path.relpath(full, stage).replace(os.sep, "/")
+            z.write(full, arc)
+'@ | python -
+
+          # Fail the build if a Windows backslash slips into any archive path.
+          @'
+import os
+import zipfile
+
+p = os.path.join(os.environ["GITHUB_WORKSPACE"], "foo_stem_separator.fb2k-component")
+with zipfile.ZipFile(p) as z:
+    names = z.namelist()
+    bad = [n for n in names if "\\" in n]
+    if bad:
+        raise SystemExit("Backslash ZIP entries found: " + repr(bad))
+    required = {
+        "foo_stem_separator.dll",
+        "x64/foo_stem_separator.dll",
+        "sherpa-onnx-c-api.dll",
+        "x64/sherpa-onnx-c-api.dll",
+        "onnxruntime.dll",
+        "x64/onnxruntime.dll",
+        "x64/DirectML.dll",
+        "models/spleeter/vocals.fp16.onnx",
+        "models/spleeter/accompaniment.fp16.onnx",
+    }
+    missing = sorted(required.difference(names))
+    if missing:
+        raise SystemExit("Missing normalized ZIP entries: " + repr(missing))
+'@ | python -
 
       - name: Upload universal component
         uses: actions/upload-artifact@v4
