@@ -10,7 +10,7 @@
 
 DECLARE_COMPONENT_VERSION(
     "Stem Separator",
-    "2.8.2-test1 Universal x86+x64 Stem Blend",
+    "2.8.2-test2 Universal Package Path Fix",
     "Native ONNX vocals / instrumental separation.\n"
     "Live Original / Vocals / Instrumental switching with seek-safe cached playback and clean WAV/MP3 export.\n"
     "Lossless compressed persistent stem cache with configurable size, cache status/clear controls, start pre-cache, and dynamic backend benchmarking. x64 supports DirectML/CPU; Win32 uses CPU ONNX."
