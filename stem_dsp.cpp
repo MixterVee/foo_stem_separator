@@ -109,6 +109,17 @@ constexpr double kOriginalRollingSeconds = 45.0;
 constexpr uint64_t kOriginalRollingJoinToleranceFrames = 8;
 constexpr double kFirstBlockFadeSeconds = 0.005;
 
+#if defined(_WIN64)
+constexpr bool kAllowExternalStemPlaybackFallback = false;
+#else
+// Win32 Stem Blend is CPU-only with sherpa-onnx 1.13.4. Spectral Waveform
+// may already have separated the visible/current region and published that PCM
+// through stem_transport_service. Let normal x86 playback use those blocks only
+// when the sequential live stem cache has not caught up yet. render() always
+// prefers internal sample-locked blocks first, so this is fallback-only.
+constexpr bool kAllowExternalStemPlaybackFallback = true;
+#endif
+
 // Automatic gain matching is deliberately conservative. The target is derived
 // from the true decoded Original chunk and the already-rendered live stem chunk,
 // so no cache-format change or second inference pass is needed.
@@ -3186,7 +3197,8 @@ public:
                 cache_manager().request_transport(m_position_seconds, false);
                 std::vector<float> preview;
                 if (cache_manager().render(
-                        mode, m_position_seconds, rate, frames, preview, 1.0, false) &&
+                        mode, m_position_seconds, rate, frames, preview, 1.0,
+                        kAllowExternalStemPlaybackFallback) &&
                     preview.size() == frames * kCacheChannels) {
                     write_preview(preview);
                     transport().finish_release();
@@ -3275,7 +3287,7 @@ public:
                 frames,
                 rendered,
                 1.0,
-                false);
+                kAllowExternalStemPlaybackFallback);
 
         const audio_sample* original =
             chunk->get_data();

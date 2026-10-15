@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory=$true)][string]$SdkRoot,
     [Parameter(Mandatory=$true)][string]$RepoRoot,
     [Parameter(Mandatory=$true)][string]$WtlInclude,
-    [Parameter(Mandatory=$true)][string]$AtlInclude
+    [Parameter(Mandatory=$true)][string]$AtlInclude,
+    [ValidateSet("x64","Win32")][string]$Platform = "x64"
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,4 +20,5 @@ Copy-Item $impl (Join-Path $sampleProject.Directory.FullName "foo_stem_separator
     -SdkRoot $SdkRoot `
     -RepoRoot $RepoRoot `
     -WtlInclude $WtlInclude `
-    -AtlInclude $AtlInclude
+    -AtlInclude $AtlInclude `
+    -Platform $Platform

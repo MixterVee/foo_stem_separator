@@ -288,6 +288,12 @@ unsigned directml_adapter_index(backend value) {
 std::vector<directml_adapter_info> enumerate_directml_adapters() {
     std::vector<directml_adapter_info> out;
 
+#if !defined(_WIN64)
+    // DirectML support in the sherpa-onnx runtime used by this component is
+    // available only for Windows x64. Do not advertise unusable GPU backends
+    // in 32-bit foobar2000; x86 uses the same stem engine on CPU.
+    return out;
+#else
     ComPtr<IDXGIFactory1> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return out;
 
@@ -318,6 +324,7 @@ std::vector<directml_adapter_info> enumerate_directml_adapters() {
     }
 
     return out;
+#endif
 }
 
 backend selected_backend() {
@@ -439,8 +446,14 @@ runtime_status current_runtime_status() {
 }
 
 bool selected_backend_preference_is_gpu() {
+#if defined(_WIN64)
     const int kind = static_cast<int>(g_backend_kind_cfg.get());
     return kind == 1 || (kind == 2 && static_cast<int>(g_auto_kind_cfg.get()) == 1);
+#else
+    // sherpa-onnx 1.13.4 supports Win32/x86 ONNX Runtime, but its DirectML
+    // package is x64-only. Keep 32-bit Stem Blend explicitly CPU-only.
+    return false;
+#endif
 }
 
 struct engine::api {
@@ -475,12 +488,25 @@ std::wstring engine::dll_path() const {
 }
 
 std::wstring engine::vocals_model_path() const {
-    return (fs::path(component_directory()) / L"models" / L"spleeter" /
+    const fs::path module_dir(component_directory());
+    const fs::path local =
+        module_dir / L"models" / L"spleeter" / L"vocals.fp16.onnx";
+    if (fs::exists(local)) return local.wstring();
+
+    // Universal fb2k packages keep the Win32 component at the package root and
+    // the x64 component under x64/. Share the large Spleeter models once at the
+    // package root instead of duplicating them under x64/.
+    return (module_dir.parent_path() / L"models" / L"spleeter" /
         L"vocals.fp16.onnx").wstring();
 }
 
 std::wstring engine::accompaniment_model_path() const {
-    return (fs::path(component_directory()) / L"models" / L"spleeter" /
+    const fs::path module_dir(component_directory());
+    const fs::path local =
+        module_dir / L"models" / L"spleeter" / L"accompaniment.fp16.onnx";
+    if (fs::exists(local)) return local.wstring();
+
+    return (module_dir.parent_path() / L"models" / L"spleeter" /
         L"accompaniment.fp16.onnx").wstring();
 }
 
