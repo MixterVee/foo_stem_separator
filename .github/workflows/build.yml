@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - agent/win32-stem-blend-test1
+      - agent/win32-stem-blend-test2-package-fix
 
 jobs:
   build:
@@ -233,58 +234,67 @@ jobs:
           $component = "$env:GITHUB_WORKSPACE\foo_stem_separator.fb2k-component"
           Remove-Item $component -Force -ErrorAction SilentlyContinue
 
-          # Compress-Archive stores Windows-style backslashes in ZIP entry names.
-          # foobar2000 expects architecture selectors as POSIX-style paths such
-          # as x64/foo_stem_separator.dll. Create the archive with Python so
-          # every entry uses forward slashes exactly like the working universal
-          # Spectral Waveform package.
-          @'
-import os
-import zipfile
+          # Create the archive with explicit POSIX-style entry names.
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-stage = os.path.join(os.environ["GITHUB_WORKSPACE"], "package")
-out = os.path.join(os.environ["GITHUB_WORKSPACE"], "foo_stem_separator.fb2k-component")
+          $fs = [System.IO.File]::Open(
+            $component,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None)
+          try {
+            $zip = New-Object System.IO.Compression.ZipArchive(
+              $fs,
+              [System.IO.Compression.ZipArchiveMode]::Create,
+              $false)
+            try {
+              Get-ChildItem $stage -File -Recurse | Sort-Object FullName | ForEach-Object {
+                $relative = $_.FullName.Substring($stage.Length).TrimStart('\\','/')
+                $entryName = $relative.Replace('\\','/')
+                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                  $zip,
+                  $_.FullName,
+                  $entryName,
+                  [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+              }
+            } finally {
+              $zip.Dispose()
+            }
+          } finally {
+            $fs.Dispose()
+          }
 
-with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as z:
-    for root, dirs, files in os.walk(stage):
-        dirs.sort()
-        files.sort()
-        for name in files:
-            full = os.path.join(root, name)
-            arc = os.path.relpath(full, stage).replace(os.sep, "/")
-            z.write(full, arc)
-'@ | python -
-
-          # Fail the build if a Windows backslash slips into any archive path.
-          @'
-import os
-import zipfile
-
-p = os.path.join(os.environ["GITHUB_WORKSPACE"], "foo_stem_separator.fb2k-component")
-with zipfile.ZipFile(p) as z:
-    names = z.namelist()
-    bad = [n for n in names if "\\" in n]
-    if bad:
-        raise SystemExit("Backslash ZIP entries found: " + repr(bad))
-    required = {
-        "foo_stem_separator.dll",
-        "x64/foo_stem_separator.dll",
-        "sherpa-onnx-c-api.dll",
-        "x64/sherpa-onnx-c-api.dll",
-        "onnxruntime.dll",
-        "x64/onnxruntime.dll",
-        "x64/DirectML.dll",
-        "models/spleeter/vocals.fp16.onnx",
-        "models/spleeter/accompaniment.fp16.onnx",
-    }
-    missing = sorted(required.difference(names))
-    if missing:
-        raise SystemExit("Missing normalized ZIP entries: " + repr(missing))
-'@ | python -
+          # Verify normalized package paths before upload.
+          $check = [System.IO.Compression.ZipFile]::OpenRead($component)
+          try {
+            $names = @($check.Entries | ForEach-Object { $_.FullName })
+            $bad = @($names | Where-Object { $_ -like '*\\*' })
+            if ($bad.Count -ne 0) {
+              throw "Backslash ZIP entries found: $($bad -join ', ')"
+            }
+            foreach ($requiredEntry in @(
+              "foo_stem_separator.dll",
+              "x64/foo_stem_separator.dll",
+              "sherpa-onnx-c-api.dll",
+              "x64/sherpa-onnx-c-api.dll",
+              "onnxruntime.dll",
+              "x64/onnxruntime.dll",
+              "x64/DirectML.dll",
+              "models/spleeter/vocals.fp16.onnx",
+              "models/spleeter/accompaniment.fp16.onnx"
+            )) {
+              if ($names -notcontains $requiredEntry) {
+                throw "Missing normalized ZIP entry: $requiredEntry"
+              }
+            }
+          } finally {
+            $check.Dispose()
+          }
 
       - name: Upload universal component
         uses: actions/upload-artifact@v4
         with:
-          name: foo_stem_separator-2.8.2-test1-universal
+          name: foo_stem_separator-2.8.2-test2-universal
           path: foo_stem_separator.fb2k-component
           if-no-files-found: error
