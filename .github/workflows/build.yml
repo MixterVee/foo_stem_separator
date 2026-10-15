@@ -5,8 +5,9 @@ on:
   push:
     branches:
       - main
-      - agent/win32-stem-blend-test1
-      - agent/win32-stem-blend-test2-package-fix
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -211,7 +212,7 @@ jobs:
           Copy-Item "shared-models\spleeter\*" "$stage\models\spleeter" -Force
 
           Set-Content "$stage\BACKENDS.txt" @(
-            "Stem Separator 2.8.2-test1 universal x86+x64",
+            "Stem Separator 2.8.2 universal x86+x64",
             "x64: CPU + DirectML backends",
             "Win32/x86: CPU ONNX backend",
             "Spleeter two-stem FP16 models are shared between architectures."
@@ -295,6 +296,26 @@ jobs:
       - name: Upload universal component
         uses: actions/upload-artifact@v4
         with:
-          name: foo_stem_separator-2.8.2-test2-universal
+          name: foo_stem_separator-2.8.2-universal
           path: foo_stem_separator.fb2k-component
           if-no-files-found: error
+
+      - name: Prepare stable release asset
+        if: github.ref == 'refs/heads/main'
+        shell: powershell
+        run: |
+          Copy-Item "foo_stem_separator.fb2k-component" "Stem-Separator-2.8.2-Universal-x86-x64.fb2k-component" -Force
+
+      - name: Publish GitHub latest release
+        if: github.ref == 'refs/heads/main'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v2.8.2" `
+            "Stem-Separator-2.8.2-Universal-x86-x64.fb2k-component" `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --target "$env:GITHUB_SHA" `
+            --title "Stem Separator 2.8.2" `
+            --notes "Stable universal Win32/x64 release. x64 supports CPU and DirectML; Win32/x86 uses CPU ONNX. Includes live Original/Vocals/Instrumental/Blend switching, persistent cache, pre-cache, seek-safe playback, WAV/MP3 export, gain matching, and shared Spleeter models. Remember to add Stem Separator (ONNX) to Active DSPs separately in each foobar2000 installation." `
+            --latest
