@@ -9,13 +9,16 @@ param(
     [string]$WtlInclude,
 
     [Parameter(Mandatory=$true)]
-    [string]$AtlInclude
+    [string]$AtlInclude,
+
+    [ValidateSet("x64","Win32")]
+    [string]$Platform = "x64"
 )
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "==============================================="
-Write-Host "V12 - NATIVE ONNX DSP PROTOTYPE"
+Write-Host "V12 - NATIVE ONNX DSP PROTOTYPE ($Platform)"
 Write-Host "==============================================="
 
 $sampleProject = Get-ChildItem -Path $SdkRoot -Filter "foo_sample.vcxproj" -Recurse |
@@ -150,7 +153,7 @@ try {
         /m `
         /t:Build `
         /p:Configuration=Release `
-        /p:Platform=x64 `
+        /p:Platform=$Platform `
         /p:PlatformToolset=v143 `
         /p:LanguageStandard=stdcpp17 `
         /v:minimal
